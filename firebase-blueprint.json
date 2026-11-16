@@ -58,6 +58,9 @@
         "stopRadiusMeters": { "type": "number" },
         "plantGeofenceMeters": { "type": "number" },
         "gpsSampleIntervalSeconds": { "type": "number" },
+        "gpsPowerSaveEnabled": { "type": "boolean" },
+        "gpsPowerSaveIntervalSeconds": { "type": "number" },
+        "gpsStationaryDwellSeconds": { "type": "number" },
         "gpsWeakAccuracyMeters": { "type": "number" },
         "gpsGapSeconds": { "type": "number" },
         "plantLocation": { "type": "object" },
@@ -425,6 +428,60 @@
         "serverUpdatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "ownerId", "createdAt", "createdBy", "title", "message", "status", "serverCreatedAt", "serverUpdatedAt"]
+    },
+    "TripStateLogDoc": {
+      "title": "TripStateLogDoc",
+      "description": "Immutable trip lifecycle state transition audit record for manager review",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "tripId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "tripNumber": { "type": "string", "maxLength": 64 },
+        "truckId": { "type": "string", "maxLength": 128 },
+        "driverId": { "type": "string", "maxLength": 128 },
+        "driverName": { "type": "string", "maxLength": 120 },
+        "fromState": {
+          "type": "string",
+          "enum": [
+            "none", "draft", "pending_approval", "approved", "accepted", "declined",
+            "in_progress", "in_transit", "paused", "returned_to_plant",
+            "pending_sync", "synced", "completed_pending_review", "completed",
+            "closed", "rejected"
+          ],
+          "maxLength": 40
+        },
+        "toState": {
+          "type": "string",
+          "enum": [
+            "none", "draft", "pending_approval", "approved", "accepted", "declined",
+            "in_progress", "in_transit", "paused", "returned_to_plant",
+            "pending_sync", "synced", "completed_pending_review", "completed",
+            "closed", "rejected"
+          ],
+          "maxLength": 40
+        },
+        "triggerSource": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "actorRole": { "type": "string", "enum": ["manager", "driver", "system"], "maxLength": 20 },
+        "actorName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "reason": { "type": "string", "maxLength": 500 },
+        "details": { "type": "string", "maxLength": 1000 },
+        "lat": { "type": "number" },
+        "lng": { "type": "number" },
+        "speedKmH": { "type": "number" },
+        "timestamp": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "timestampEpochMs": { "type": "number" },
+        "reviewedByManager": { "type": "boolean" },
+        "reviewedAt": { "type": "string", "maxLength": 64 },
+        "reviewNote": { "type": "string", "maxLength": 500 },
+        "serverCreatedAt": { "type": "string", "format": "date-time" },
+        "serverUpdatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "ownerId", "tripId", "fromState", "toState", "triggerSource",
+        "actorRole", "actorName", "timestamp", "timestampEpochMs",
+        "reviewedByManager", "serverCreatedAt", "serverUpdatedAt"
+      ]
     }
   },
   "firestore": {
@@ -463,6 +520,10 @@
     "/trips/{tripId}": {
       "schema": { "$ref": "#/entities/TripDoc" },
       "description": "Persistent trips, stops, GPS track points, and audit logs"
+    },
+    "/tripStateLogs/{logId}": {
+      "schema": { "$ref": "#/entities/TripStateLogDoc" },
+      "description": "Persistent trip state transition logs for manager review"
     },
     "/invoices/{invoiceId}": {
       "schema": { "$ref": "#/entities/InvoiceDoc" },

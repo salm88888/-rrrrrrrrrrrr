@@ -69,9 +69,9 @@ service cloud.firestore {
         data.ownerId.size() <= 128 &&
         data.ownerId == request.auth.uid &&
         data.serverCreatedAt is timestamp &&
-        data.serverCreatedAt == request.time &&
+        data.serverCreatedAt <= request.time &&
         data.serverUpdatedAt is timestamp &&
-        data.serverUpdatedAt == request.time;
+        data.serverUpdatedAt <= request.time;
     }
 
     function hasValidAuditUpdate() {
@@ -79,7 +79,7 @@ service cloud.firestore {
         incoming().ownerId == existing().ownerId &&
         incoming().serverCreatedAt == existing().serverCreatedAt &&
         incoming().serverUpdatedAt is timestamp &&
-        incoming().serverUpdatedAt == request.time;
+        incoming().serverUpdatedAt <= request.time;
     }
 
     // --- Entity Validation Helpers ---
@@ -124,7 +124,8 @@ service cloud.firestore {
           'id', 'ownerId', 'waterProductionCostPerLiter', 'defaultSellingPricePerLiter',
           'dieselPricePerLiter', 'truckDieselConsumptionPerKm', 'maintenanceAllowancePerTrip',
           'driverWagePerTrip', 'stopDetectionMinutes', 'minMovementSpeedKmH', 'stopRadiusMeters',
-          'plantGeofenceMeters', 'gpsSampleIntervalSeconds', 'gpsWeakAccuracyMeters',
+          'plantGeofenceMeters', 'gpsSampleIntervalSeconds', 'gpsPowerSaveEnabled',
+          'gpsPowerSaveIntervalSeconds', 'gpsStationaryDwellSeconds', 'gpsWeakAccuracyMeters',
           'gpsGapSeconds', 'plantLocation', 'customDistricts', 'demoDataActive',
           'demoDataClearedAt', 'demoResetVersion', 'managerPin',
           'serverCreatedAt', 'serverUpdatedAt'
@@ -141,6 +142,9 @@ service cloud.firestore {
         isOptionalNumber(data, 'stopRadiusMeters') &&
         isOptionalNumber(data, 'plantGeofenceMeters') &&
         isOptionalNumber(data, 'gpsSampleIntervalSeconds') &&
+        isOptionalBool(data, 'gpsPowerSaveEnabled') &&
+        isOptionalNumber(data, 'gpsPowerSaveIntervalSeconds') &&
+        isOptionalNumber(data, 'gpsStationaryDwellSeconds') &&
         isOptionalNumber(data, 'gpsWeakAccuracyMeters') &&
         isOptionalNumber(data, 'gpsGapSeconds') &&
         data.plantLocation is map &&
@@ -526,6 +530,56 @@ service cloud.firestore {
         data.serverUpdatedAt is timestamp;
     }
 
+    function isValidTripStateValue(val) {
+      return val is string &&
+        val.size() >= 1 &&
+        val.size() <= 40 &&
+        val in [
+          'none', 'draft', 'pending_approval', 'approved', 'accepted', 'declined',
+          'in_progress', 'in_transit', 'paused', 'returned_to_plant',
+          'pending_sync', 'synced', 'completed_pending_review', 'completed',
+          'closed', 'rejected'
+        ];
+    }
+
+    function isValidTripStateLog(data, docId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'tripId', 'fromState', 'toState', 'triggerSource',
+          'actorRole', 'actorName', 'timestamp', 'timestampEpochMs',
+          'reviewedByManager', 'serverCreatedAt', 'serverUpdatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'ownerId', 'tripId', 'tripNumber', 'truckId', 'driverId', 'driverName',
+          'fromState', 'toState', 'triggerSource', 'actorRole', 'actorName',
+          'reason', 'details', 'lat', 'lng', 'speedKmH',
+          'timestamp', 'timestampEpochMs', 'reviewedByManager', 'reviewedAt', 'reviewNote',
+          'serverCreatedAt', 'serverUpdatedAt'
+        ]) &&
+        data.id is string && data.id == docId && data.id.size() <= 128 &&
+        isValidId(data.tripId) &&
+        isOptionalString(data, 'tripNumber', 64) &&
+        isOptionalString(data, 'truckId', 128) &&
+        isOptionalString(data, 'driverId', 128) &&
+        isOptionalString(data, 'driverName', 120) &&
+        isValidTripStateValue(data.fromState) &&
+        isValidTripStateValue(data.toState) &&
+        data.triggerSource is string && data.triggerSource.size() >= 1 && data.triggerSource.size() <= 64 &&
+        data.actorRole is string && data.actorRole in ['manager', 'driver', 'system'] &&
+        data.actorName is string && data.actorName.size() >= 1 && data.actorName.size() <= 120 &&
+        isOptionalString(data, 'reason', 500) &&
+        isOptionalString(data, 'details', 1000) &&
+        isOptionalNumber(data, 'lat') &&
+        isOptionalNumber(data, 'lng') &&
+        isOptionalNumber(data, 'speedKmH') &&
+        data.timestamp is string && data.timestamp.size() >= 1 && data.timestamp.size() <= 64 &&
+        data.timestampEpochMs is number &&
+        data.reviewedByManager is bool &&
+        isOptionalString(data, 'reviewedAt', 64) &&
+        isOptionalString(data, 'reviewNote', 500) &&
+        data.serverCreatedAt is timestamp &&
+        data.serverUpdatedAt is timestamp;
+    }
+
     // --- Collection Rules ---
 
     // Connection check document (authenticated get only, no list or writes)
@@ -538,8 +592,8 @@ service cloud.firestore {
     match /admins/{userId} {
       allow get: if isValidId(userId) && isAdmin();
       allow list: if isBootstrappedAdmin();
-      allow create: if isValidId(userId) && isAdmin() && isValidAdminUser(incoming(), userId) && incoming().serverCreatedAt == request.time && incoming().serverUpdatedAt == request.time;
-      allow update: if isValidId(userId) && isAdmin() && isValidAdminUser(incoming(), userId) && incoming().uid == existing().uid && incoming().serverCreatedAt == existing().serverCreatedAt && incoming().serverUpdatedAt == request.time;
+      allow create: if isValidId(userId) && isAdmin() && isValidAdminUser(incoming(), userId) && incoming().serverCreatedAt <= request.time && incoming().serverUpdatedAt <= request.time;
+      allow update: if isValidId(userId) && isAdmin() && isValidAdminUser(incoming(), userId) && incoming().uid == existing().uid && incoming().serverCreatedAt == existing().serverCreatedAt && incoming().serverUpdatedAt <= request.time;
       allow delete: if isValidId(userId) && isBootstrappedAdmin();
     }
 
@@ -570,7 +624,8 @@ service cloud.firestore {
           'waterProductionCostPerLiter', 'defaultSellingPricePerLiter', 'dieselPricePerLiter',
           'truckDieselConsumptionPerKm', 'maintenanceAllowancePerTrip', 'driverWagePerTrip',
           'stopDetectionMinutes', 'minMovementSpeedKmH', 'stopRadiusMeters', 'plantGeofenceMeters',
-          'gpsSampleIntervalSeconds', 'gpsWeakAccuracyMeters', 'gpsGapSeconds',
+          'gpsSampleIntervalSeconds', 'gpsPowerSaveEnabled', 'gpsPowerSaveIntervalSeconds',
+          'gpsStationaryDwellSeconds', 'gpsWeakAccuracyMeters', 'gpsGapSeconds',
           'plantLocation', 'customDistricts', 'demoDataActive', 'demoDataClearedAt',
           'demoResetVersion', 'managerPin', 'serverUpdatedAt'
         ])
@@ -740,6 +795,29 @@ service cloud.firestore {
         )
       );
       allow delete: if isValidId(directiveId) && (isAdmin() || isDocOwner());
+    }
+
+    match /tripStateLogs/{logId} {
+      allow get: if isValidId(logId) && (isAdmin() || isDocOwner());
+      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow create: if isValidId(logId) && isSignedIn() && isValidTripStateLog(incoming(), logId) && hasValidAuditCreate(incoming()) && (isAdmin() || incoming().reviewedByManager == false);
+      allow update: if isValidId(logId) && (isAdmin() || isDocOwner()) && isValidTripStateLog(incoming(), logId) && hasValidAuditUpdate() &&
+        incoming().tripId == existing().tripId &&
+        incoming().fromState == existing().fromState &&
+        incoming().toState == existing().toState &&
+        incoming().triggerSource == existing().triggerSource &&
+        incoming().actorRole == existing().actorRole &&
+        incoming().actorName == existing().actorName &&
+        incoming().timestamp == existing().timestamp &&
+        incoming().timestampEpochMs == existing().timestampEpochMs &&
+        (
+          isAdmin() ||
+          (
+            existing().reviewedByManager == false &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['serverUpdatedAt'])
+          )
+        );
+      allow delete: if isValidId(logId) && isAdmin();
     }
   }
 }

@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">مياهنا - التوزيع الذكي</string>
+    <string name="app_subtitle">نظام إدارة مصنع المياه وتوزيع الصهاريج - مأرب، اليمن</string>
+
+    <!-- Role Selection & Auth -->
+    <string name="portal_title">بوابة مياهنا الذكية</string>
+    <string name="portal_subtitle">إدارة محطة التحلية وتوزيع الوايتات في مأرب - مديرية الوادي</string>
+    <string name="role_manager_title">دخول الإدارة والعمليات</string>
+    <string name="role_manager_desc">لوحة القيادة، التجميع الذكي، اعتماد الرحلات، الخريطة والتسويات</string>
+    <string name="role_driver_title">تطبيق سائق الوايت</string>
+    <string name="role_driver_desc">جدول محطات التوصيل، الطلبات الميدانية، الوقود والمزامنة</string>
+    <string name="manager_pin_title">رمز دخول الإدارة</string>
+    <string name="manager_pin_hint">أدخل رمز PIN للإدارة</string>
+    <string name="manager_pin_invalid">رمز PIN غير صحيح، يرجى المحاولة مرة أخرى</string>
+    <string name="driver_login_title">دخول السائق</string>
+    <string name="driver_register_title">طلب حساب سائق جديد</string>
+
+    <!-- Actions & Common -->
+    <string name="confirm">تأكيد</string>
+    <string name="cancel">إلغاء</string>
+    <string name="save">حفظ</string>
+    <string name="close">إغلاق</string>
+    <string name="delete">حذف</string>
+    <string name="edit">تعديل</string>
+    <string name="search">بحث...</string>
+    <string name="online_status">متصل بالشبكة</string>
+    <string name="offline_status">وضع عدم الاتصال</string>
+    <string name="sync_now">مزامنة الآن</string>
+    <string name="switch_role">تبديل الدور</string>
+
+    <!-- Cloud Auth -->
+    <string name="bootstrapped_admin_email" translatable="false">salemjalaal1@gmail.com</string>
+    <string name="cloud_signin_google">ربط السحابة بحساب Google</string>
+    <string name="cloud_connected">السحابة متصلة</string>
+    <string name="cloud_signout">فصل السحابة</string>
+
+    <!-- Google Maps & Database -->
+    <string name="map_mode_google">خرائط Google</string>
+    <string name="map_mode_vector">خريطة محلية</string>
+    <string name="map_type_normal">عادي</string>
+    <string name="map_type_satellite">قمر صناعي</string>
+    <string name="map_type_hybrid">هجين</string>
+    <string name="maps_key_missing_hint">لتفعيل خرائط Google الحية أضف MAPS_API_KEY في لوحة الأسرار (Secrets) — تعمل الخريطة المحلية حالياً بدون انقطاع.</string>
+
+    <!-- Manager Navigation Tabs -->
+    <string name="tab_overview">نظرة عامة</string>
+    <string name="tab_orders">الطلبات</string>
+    <string name="tab_clustering">التجميع الذكي</string>
+    <string name="tab_trips">الرحلات والتتبع</string>
+    <string name="tab_map">خريطة مأرب</string>
+    <string name="tab_customers">العملاء</string>
+    <string name="tab_invoices">الفواتير والنقدية</string>
+    <string name="tab_reconciliation">تسوية السائقين</string>
+    <string name="tab_expenses">المصروفات والديزل</string>
+    <string name="tab_profitability">الربحية والتحليلات</string>
+    <string name="tab_drivers">السائقين والوايت</string>
+    <string name="tab_settings">إعدادات النظام</string>
+
+    <!-- Driver Navigation Tabs -->
+    <string name="driver_tab_trip">الرحلة الحالية</string>
+    <string name="driver_tab_gps">الوقود والتسليم</string>
+    <string name="driver_tab_field_order">طلب/عميل ميداني</string>
+    <string name="driver_tab_sync">المزامنة</string>
+
+    <!-- Permissions & Operational Services -->
+    <string name="location_permission_title">صلاحية الموقع مطلوبة لعمليات التوصيل</string>
+    <string name="location_permission_rationale">يستخدم تطبيق مياهنا صلاحية الموقع لتحديد موقع المصنع ومحطات العملاء وتوثيق مواقع التسليم واحتساب المسافات أثناء الرحلات.</string>
+    <string name="grant_permission">تفعيل صلاحية الموقع</string>
+    <string name="notification_channel_tracking_name">خدمة التوصيل والموقع</string>
+    <string name="notification_channel_tracking_desc">تشغيل خدمة الموقع لتنسيق رحلات التوصيل واستقبال التنبيهات</string>
+    <string name="tracking_notification_title">مياهنا — خدمة التوصيل نشطة</string>
+    <string name="tracking_notification_text">خدمة الموقع والتنبيهات الفورية تعمل لرحلات التوصيل</string>
+    <string name="notification_channel_alerts_name">إشعارات وتوجيهات مياهنا</string>
+    <string name="notification_channel_alerts_desc">تنبيهات فورية للرحلات والطلبات والتوجيهات الإدارية حتى عند إغلاق التطبيق</string>
+    <string name="notification_permission_title">تفعيل الإشعارات الفورية</string>
+    <string name="notification_permission_rationale">فعّل صلاحية الإشعارات لاستقبال تنبيهات الرحلات والطلبات والتوجيهات الفورية حتى عند الخروج من التطبيق.</string>
+    <string name="grant_notifications_button">تفعيل الإشعارات</string>
+
+    <!-- Customer Management -->
+    <string name="customer_add_title">إضافة عميل جديد</string>
+    <string name="customer_edit_title">تعديل بيانات العميل</string>
+    <string name="customer_delete_title">حذف العميل</string>
+    <string name="customer_delete_confirm">هل أنت متأكد من حذف هذا العميل من قاعدة البيانات المحلية والسحابية؟</string>
+    <string name="customer_name_label">اسم العميل *</string>
+    <string name="customer_phone_label">رقم الهاتف الأساسي</string>
+    <string name="customer_alt_phone_label">رقم هاتف بديل (اختياري)</string>
+    <string name="customer_address_label">العنوان التفصيلي / وصف المنزل</string>
+
+    <!-- Delivery Location Capture Service -->
+    <string name="notification_channel_delivery_capture_name">تسجيل مواقع التسليم</string>
+    <string name="notification_channel_delivery_capture_desc">التقاط إحداثيات GPS الحالية عند تسليم المياه</string>
+    <string name="delivery_capture_notification_title">التقاط موقع التسليم (GPS)</string>
+    <string name="delivery_capture_notification_text">جاري تحديد موقع الوايت الحالي وحفظه في قاعدة البيانات...</string>
+    <string name="delivery_capture_button">تسجيل موقع التسليم الحالي (GPS)</string>
+    <string name="delivery_capture_in_progress">جاري التقاط موقع GPS الحالي...</string>
+    <string name="delivery_capture_permission_missing">يرجى تفعيل صلاحية الموقع أولاً لتسجيل موقع التسليم</string>
+    <string name="delivery_capture_unavailable">تعذر الحصول على إشارة GPS حالياً، تأكد من تفعيل الموقع</string>
+
+    <!-- Always-On Driver Background GPS & Auto Sync -->
+    <string name="bg_gps_active_title">GPS الخلفي يعمل دائماً</string>
+    <string name="bg_gps_active_desc">يستمر تسجيل مسار الرحلة محلياً حتى عند الخروج من التطبيق أو انقطاع الإنترنت، وتتم المزامنة والإرسال للمدير تلقائياً فور توفر الشبكة.</string>
+    <string name="bg_gps_inactive_title">خدمة GPS الخلفية متوقفة</string>
+    <string name="bg_gps_inactive_desc">اضغط لتشغيل التتبع المستمر في الخلفية طوال مناوبة السائق.</string>
+    <string name="bg_gps_activate_button">تشغيل GPS الخلفي الآن</string>
+    <string name="driver_finish_trip_button">إنهاء الرحلة وإرسال التقرير للمدير</string>
+    <string name="driver_finish_trip_confirm_title">تأكيد إنهاء الرحلة</string>
+    <string name="driver_finish_trip_confirm_body">سيتم حفظ بيانات الرحلة وإرسالها للمدير فوراً إذا توفر الإنترنت، أو جدولتها للمزامنة التلقائية فور عودة الاتصال.</string>
+
+    <!-- Centralized Admin Fleet Dashboard -->
+    <string name="fleet_dashboard_title">لوحة مراقبة الأسطول المباشرة</string>
+    <string name="fleet_live_stream_badge">تحديث سحابي مباشر</string>
+    <string name="fleet_local_mode_badge">الوضع المحلي (مزامنة عند الاتصال)</string>
+    <string name="fleet_search_hint">ابحث بالرمز، رقم اللوحة، السائق، أو الهاتف...</string>
+    <string name="fleet_filter_moving_only">متحركة الآن</string>
+    <string name="fleet_filter_active_trip">في رحلة نشطة</string>
+    <string name="fleet_clear_filters">مسح الفلاتر</string>
+    <string name="fleet_add_truck">إضافة صهريج</string>
+    <string name="fleet_show_customers">إظهار العملاء</string>
+    <string name="fleet_no_matching_trucks">لا توجد صهاريج مطابقة للفلتر الحالي</string>
+    <string name="fleet_no_matching_trucks_sub">جرّب تعديل معايير البحث أو إزالة الفلاتر النشطة لعرض جميع شاحنات الأسطول.</string>
+    <string name="fleet_sync_now">تحديث الآن</string>
+    <string name="fleet_center_on_truck">تركيز على الصهريج</string>
+    <string name="fleet_center_on_plant">موقع المصنع</string>
+    <string name="fleet_open_trips">فتح تفاصيل الرحلة</string>
+</resources>
