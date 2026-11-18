@@ -63,6 +63,28 @@ service cloud.firestore {
       return !(field in data) || (data[field] is list && data[field].size() <= maxLen);
     }
 
+    function isOptionalBoundedEmailList(data, field, maxLen) {
+      return !(field in data) || (
+        data[field] is list &&
+        data[field].size() <= maxLen &&
+        (data[field].size() == 0 || (data[field][0] is string && data[field][0].size() <= 254))
+      );
+    }
+
+    function isSharedMember(data) {
+      return isSignedIn() &&
+        request.auth.token.email is string &&
+        ('memberEmails' in data) &&
+        data.memberEmails is list &&
+        (request.auth.token.email.lower() in data.memberEmails);
+    }
+
+    function isSharedMemberList(data) {
+      return isSignedIn() &&
+        request.auth.token.email is string &&
+        (request.auth.token.email.lower() in data.memberEmails);
+    }
+
     function hasValidAuditCreate(data) {
       return data.ownerId is string &&
         data.ownerId.size() >= 1 &&
@@ -121,7 +143,7 @@ service cloud.firestore {
           'dieselPricePerLiter', 'plantLocation', 'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.keys().hasOnly([
-          'id', 'ownerId', 'waterProductionCostPerLiter', 'defaultSellingPricePerLiter',
+          'id', 'ownerId', 'memberEmails', 'waterProductionCostPerLiter', 'defaultSellingPricePerLiter',
           'dieselPricePerLiter', 'truckDieselConsumptionPerKm', 'maintenanceAllowancePerTrip',
           'driverWagePerTrip', 'stopDetectionMinutes', 'minMovementSpeedKmH', 'stopRadiusMeters',
           'plantGeofenceMeters', 'gpsSampleIntervalSeconds', 'gpsPowerSaveEnabled',
@@ -131,6 +153,7 @@ service cloud.firestore {
           'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.id is string && data.id == docId && data.id.size() <= 128 &&
+        isOptionalBoundedEmailList(data, 'memberEmails', 25) &&
         data.waterProductionCostPerLiter is number &&
         data.defaultSellingPricePerLiter is number &&
         data.dieselPricePerLiter is number &&
@@ -167,12 +190,13 @@ service cloud.firestore {
     function isValidTruck(data, docId) {
       return data.keys().hasAll(['id', 'ownerId', 'plateNumber', 'maxCapacityLiters', 'status', 'serverCreatedAt', 'serverUpdatedAt']) &&
         data.keys().hasOnly([
-          'id', 'ownerId', 'code', 'plateNumber', 'model', 'maxCapacityLiters',
+          'id', 'ownerId', 'memberEmails', 'code', 'plateNumber', 'model', 'maxCapacityLiters',
           'currentWaterLiters', 'driverId', 'driverName', 'driverPhone', 'status',
           'lastLat', 'lastLng', 'lastSpeed', 'lastUpdateTimestamp', 'lastEvent',
           'currentTripId', 'odometerKm', 'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.id is string && data.id == docId && data.id.size() <= 128 &&
+        isOptionalBoundedEmailList(data, 'memberEmails', 25) &&
         isOptionalString(data, 'code', 64) &&
         data.plateNumber is string && data.plateNumber.size() <= 64 &&
         isOptionalString(data, 'model', 120) &&
@@ -196,16 +220,18 @@ service cloud.firestore {
     function isValidDriverAccount(data, docId) {
       return data.keys().hasAll(['id', 'ownerId', 'name', 'username', 'phone', 'password', 'status', 'createdAt', 'serverCreatedAt', 'serverUpdatedAt']) &&
         data.keys().hasOnly([
-          'id', 'ownerId', 'name', 'username', 'phone', 'password', 'licenseNumber',
-          'status', 'createdAt', 'createdBy', 'approvedAt', 'approvedBy',
+          'id', 'ownerId', 'memberEmails', 'name', 'username', 'phone', 'password', 'googleEmail',
+          'licenseNumber', 'status', 'createdAt', 'createdBy', 'approvedAt', 'approvedBy',
           'rejectedAt', 'rejectionReason', 'lastLoginAt', 'isDemo',
           'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.id is string && data.id == docId && data.id.size() <= 128 &&
+        isOptionalBoundedEmailList(data, 'memberEmails', 25) &&
         data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
         data.username is string && data.username.size() >= 1 && data.username.size() <= 64 &&
         data.phone is string && data.phone.size() >= 1 && data.phone.size() <= 32 &&
         data.password is string && data.password.size() >= 4 && data.password.size() <= 128 &&
+        isOptionalString(data, 'googleEmail', 254) &&
         isOptionalString(data, 'licenseNumber', 64) &&
         data.status is string && data.status in ['pending', 'approved', 'rejected', 'suspended'] && data.status.size() <= 24 &&
         data.createdAt is string && data.createdAt.size() <= 64 &&
@@ -223,12 +249,13 @@ service cloud.firestore {
     function isValidCustomer(data, docId) {
       return data.keys().hasAll(['id', 'ownerId', 'name', 'phone', 'district', 'lat', 'lng', 'tankCapacityLiters', 'createdAt', 'serverCreatedAt', 'serverUpdatedAt']) &&
         data.keys().hasOnly([
-          'id', 'ownerId', 'customerId', 'name', 'phone', 'altPhone', 'district',
+          'id', 'ownerId', 'memberEmails', 'customerId', 'name', 'phone', 'altPhone', 'district',
           'addressDetails', 'lat', 'lng', 'tankCapacityLiters', 'tankRemainingLiters',
           'notes', 'createdAt', 'isActive', 'totalOrdersCount', 'totalLitersDelivered',
           'isOfflineCreated', 'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.id is string && data.id == docId && data.id.size() <= 128 &&
+        isOptionalBoundedEmailList(data, 'memberEmails', 25) &&
         isOptionalString(data, 'customerId', 64) &&
         data.name is string && data.name.size() >= 1 && data.name.size() <= 150 &&
         data.phone is string && data.phone.size() <= 32 &&
@@ -252,13 +279,14 @@ service cloud.firestore {
     function isValidOrder(data, docId) {
       return data.keys().hasAll(['id', 'ownerId', 'customerName', 'phone', 'district', 'requestedLiters', 'status', 'createdAt', 'serverCreatedAt', 'serverUpdatedAt']) &&
         data.keys().hasOnly([
-          'id', 'ownerId', 'orderNumber', 'customerId', 'customerName', 'phone', 'district',
+          'id', 'ownerId', 'memberEmails', 'orderNumber', 'customerId', 'customerName', 'phone', 'district',
           'addressDetails', 'lat', 'lng', 'tankCapacity', 'tankRemainingLiters',
           'requestedLiters', 'pricePerLiter', 'totalAmount', 'source', 'createdAt',
           'scheduledDate', 'notes', 'status', 'tripId', 'isUrgent', 'duplicateWarning',
           'duplicateMatchedOrderId', 'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.id is string && data.id == docId && data.id.size() <= 128 &&
+        isOptionalBoundedEmailList(data, 'memberEmails', 25) &&
         isOptionalString(data, 'orderNumber', 64) &&
         isOptionalString(data, 'customerId', 128) &&
         data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 150 &&
@@ -288,7 +316,7 @@ service cloud.firestore {
     function isValidTrip(data, docId) {
       return data.keys().hasAll(['id', 'ownerId', 'tripNumber', 'status', 'customerStops', 'orderIds', 'proposedAt', 'serverCreatedAt', 'serverUpdatedAt']) &&
         data.keys().hasOnly([
-          'id', 'ownerId', 'tripNumber', 'date', 'truckId', 'driverId', 'driverName', 'truckPlate',
+          'id', 'ownerId', 'memberEmails', 'tripNumber', 'date', 'truckId', 'driverId', 'driverName', 'truckPlate',
           'initialLoadLiters', 'deliveredLiters', 'remainingLiters', 'status', 'syncStatus',
           'createdByRole', 'driverAcceptanceStatus', 'driverRespondedAt', 'driverResponseReason',
           'customerStops', 'orderIds', 'proposedAt', 'submittedAt', 'approvedAt', 'approvedBy',
@@ -304,68 +332,19 @@ service cloud.firestore {
           'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.id is string && data.id == docId && data.id.size() <= 128 &&
+        isOptionalBoundedEmailList(data, 'memberEmails', 25) &&
         data.tripNumber is string && data.tripNumber.size() <= 64 &&
-        isOptionalString(data, 'date', 32) &&
-        isOptionalString(data, 'truckId', 128) &&
-        isOptionalString(data, 'driverId', 128) &&
-        isOptionalString(data, 'driverName', 120) &&
-        isOptionalString(data, 'truckPlate', 64) &&
-        isOptionalNumber(data, 'initialLoadLiters') &&
-        isOptionalNumber(data, 'deliveredLiters') &&
-        isOptionalNumber(data, 'remainingLiters') &&
         data.status is string && data.status.size() <= 40 &&
-        isOptionalString(data, 'syncStatus', 32) &&
-        isOptionalString(data, 'createdByRole', 20) &&
-        isOptionalString(data, 'driverAcceptanceStatus', 32) &&
-        isOptionalString(data, 'driverRespondedAt', 64) &&
-        isOptionalString(data, 'driverResponseReason', 500) &&
+        (!('driverAcceptanceStatus' in data) || (data.driverAcceptanceStatus is string && data.driverAcceptanceStatus.size() <= 32)) &&
         data.customerStops is list && data.customerStops.size() <= 50 &&
         data.orderIds is list && data.orderIds.size() <= 50 &&
-        (data.orderIds.size() == 0 || (data.orderIds[0] is string && data.orderIds[0].size() <= 128)) &&
         data.proposedAt is string && data.proposedAt.size() <= 64 &&
-        isOptionalString(data, 'submittedAt', 64) &&
-        isOptionalString(data, 'approvedAt', 64) &&
-        isOptionalString(data, 'approvedBy', 120) &&
-        isOptionalString(data, 'rejectedAt', 64) &&
-        isOptionalString(data, 'rejectedBy', 120) &&
-        isOptionalString(data, 'rejectionReason', 500) &&
-        isOptionalString(data, 'returnedForEditReason', 500) &&
-        isOptionalString(data, 'startedAt', 64) &&
-        isOptionalMap(data, 'startLocation') &&
-        isOptionalString(data, 'returnedToPlantAt', 64) &&
-        isOptionalMap(data, 'returnLocation') &&
-        isOptionalString(data, 'completedAt', 64) &&
-        isOptionalString(data, 'closedAt', 64) &&
-        isOptionalString(data, 'closedBy', 120) &&
-        isOptionalString(data, 'reconciledAt', 64) &&
-        isOptionalString(data, 'lastSyncedAt', 64) &&
-        isOptionalBoundedList(data, 'gpsPoints', 2000) &&
-        isOptionalBoundedList(data, 'detectedStops', 200) &&
-        isOptionalBoundedList(data, 'gpsGaps', 200) &&
-        isOptionalNumber(data, 'movingMinutes') &&
-        isOptionalNumber(data, 'stoppedMinutes') &&
-        isOptionalBoundedList(data, 'auditLogs', 500) &&
-        isOptionalBoundedList(data, 'modificationRequests', 50) &&
-        isOptionalNumber(data, 'estimatedDistanceKm') &&
-        isOptionalNumber(data, 'actualDistanceKm') &&
-        isOptionalNumber(data, 'estimatedFuelLiters') &&
-        isOptionalNumber(data, 'actualFuelLiters') &&
-        isOptionalNumber(data, 'fuelCost') &&
-        isOptionalNumber(data, 'productionCost') &&
-        isOptionalNumber(data, 'driverWageShare') &&
-        isOptionalNumber(data, 'maintenanceShare') &&
-        isOptionalNumber(data, 'otherExpensesShare') &&
-        isOptionalNumber(data, 'totalCost') &&
-        isOptionalNumber(data, 'actualCost') &&
-        isOptionalNumber(data, 'expectedRevenue') &&
-        isOptionalNumber(data, 'actualRevenue') &&
-        isOptionalNumber(data, 'expectedProfit') &&
-        isOptionalNumber(data, 'actualProfit') &&
-        isOptionalNumber(data, 'profitMarginPercent') &&
-        isOptionalNumber(data, 'capacityUtilizationPercent') &&
-        isOptionalString(data, 'departureRecommendation', 32) &&
-        isOptionalString(data, 'recommendationReason', 500) &&
-        isOptionalString(data, 'notes', 1000) &&
+        (!('gpsPoints' in data) || (data.gpsPoints is list && data.gpsPoints.size() <= 2000)) &&
+        (!('detectedStops' in data) || (data.detectedStops is list && data.detectedStops.size() <= 200)) &&
+        (!('gpsGaps' in data) || (data.gpsGaps is list && data.gpsGaps.size() <= 200)) &&
+        (!('auditLogs' in data) || (data.auditLogs is list && data.auditLogs.size() <= 500)) &&
+        (!('modificationRequests' in data) || (data.modificationRequests is list && data.modificationRequests.size() <= 50)) &&
+        (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000)) &&
         data.serverCreatedAt is timestamp &&
         data.serverUpdatedAt is timestamp;
     }
@@ -457,11 +436,12 @@ service cloud.firestore {
     function isValidGpsEvent(data, docId) {
       return data.keys().hasAll(['id', 'ownerId', 'tripId', 'timestamp', 'eventType', 'lat', 'lng', 'serverCreatedAt', 'serverUpdatedAt']) &&
         data.keys().hasOnly([
-          'id', 'ownerId', 'tripId', 'tripNumber', 'timestamp', 'eventType', 'lat', 'lng',
+          'id', 'ownerId', 'memberEmails', 'tripId', 'tripNumber', 'timestamp', 'eventType', 'lat', 'lng',
           'speed', 'accuracy', 'customerId', 'customerName', 'source', 'sequenceNumber',
           'isProcessed', 'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.id is string && data.id == docId && data.id.size() <= 128 &&
+        isOptionalBoundedEmailList(data, 'memberEmails', 25) &&
         data.tripId is string && data.tripId.size() <= 128 &&
         isOptionalString(data, 'tripNumber', 64) &&
         data.timestamp is string && data.timestamp.size() <= 64 &&
@@ -482,11 +462,12 @@ service cloud.firestore {
     function isValidNotification(data, docId) {
       return data.keys().hasAll(['id', 'ownerId', 'createdAt', 'targetRole', 'title', 'message', 'isRead', 'serverCreatedAt', 'serverUpdatedAt']) &&
         data.keys().hasOnly([
-          'id', 'ownerId', 'createdAt', 'targetRole', 'actorRole', 'actorName', 'category',
+          'id', 'ownerId', 'memberEmails', 'createdAt', 'targetRole', 'actorRole', 'actorName', 'category',
           'priority', 'title', 'message', 'tripId', 'tripNumber', 'orderId', 'directiveId',
           'isRead', 'actionTab', 'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.id is string && data.id == docId && data.id.size() <= 128 &&
+        isOptionalBoundedEmailList(data, 'memberEmails', 25) &&
         data.createdAt is string && data.createdAt.size() <= 64 &&
         data.targetRole is string && data.targetRole in ['manager', 'driver'] && data.targetRole.size() <= 20 &&
         isOptionalString(data, 'actorRole', 20) &&
@@ -508,11 +489,12 @@ service cloud.firestore {
     function isValidDirective(data, docId) {
       return data.keys().hasAll(['id', 'ownerId', 'createdAt', 'createdBy', 'title', 'message', 'status', 'serverCreatedAt', 'serverUpdatedAt']) &&
         data.keys().hasOnly([
-          'id', 'ownerId', 'createdAt', 'createdBy', 'title', 'message', 'priority',
+          'id', 'ownerId', 'memberEmails', 'createdAt', 'createdBy', 'title', 'message', 'priority',
           'tripId', 'tripNumber', 'customerId', 'customerName', 'status',
           'acknowledgedAt', 'completedAt', 'driverReply', 'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.id is string && data.id == docId && data.id.size() <= 128 &&
+        isOptionalBoundedEmailList(data, 'memberEmails', 25) &&
         data.createdAt is string && data.createdAt.size() <= 64 &&
         data.createdBy is string && data.createdBy.size() <= 120 &&
         data.title is string && data.title.size() <= 300 &&
@@ -549,13 +531,14 @@ service cloud.firestore {
           'reviewedByManager', 'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.keys().hasOnly([
-          'id', 'ownerId', 'tripId', 'tripNumber', 'truckId', 'driverId', 'driverName',
+          'id', 'ownerId', 'memberEmails', 'tripId', 'tripNumber', 'truckId', 'driverId', 'driverName',
           'fromState', 'toState', 'triggerSource', 'actorRole', 'actorName',
           'reason', 'details', 'lat', 'lng', 'speedKmH',
           'timestamp', 'timestampEpochMs', 'reviewedByManager', 'reviewedAt', 'reviewNote',
           'serverCreatedAt', 'serverUpdatedAt'
         ]) &&
         data.id is string && data.id == docId && data.id.size() <= 128 &&
+        isOptionalBoundedEmailList(data, 'memberEmails', 25) &&
         isValidId(data.tripId) &&
         isOptionalString(data, 'tripNumber', 64) &&
         isOptionalString(data, 'truckId', 128) &&
@@ -615,8 +598,10 @@ service cloud.firestore {
     }
 
     match /settings/{configId} {
-      allow get: if isValidId(configId) && (isAdmin() || isDocOwner());
-      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow get: if isValidId(configId) && (isAdmin() || isDocOwner() || isSharedMember(existing()));
+      allow list: if isBootstrappedAdmin();
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSharedMemberList(resource.data);
       allow create: if isValidId(configId) && isSignedIn() && isValidSettings(incoming(), configId) && hasValidAuditCreate(incoming());
       allow update: if isValidId(configId) && (isAdmin() || isDocOwner()) && isValidSettings(incoming(), configId) && hasValidAuditUpdate() && (
         isAdmin() ||
@@ -634,37 +619,61 @@ service cloud.firestore {
     }
 
     match /trucks/{truckId} {
-      allow get: if isValidId(truckId) && (isAdmin() || isDocOwner());
-      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow get: if isValidId(truckId) && (isAdmin() || isDocOwner() || isSharedMember(existing()));
+      allow list: if isBootstrappedAdmin();
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSharedMemberList(resource.data);
       allow create: if isValidId(truckId) && isSignedIn() && isValidTruck(incoming(), truckId) && hasValidAuditCreate(incoming());
-      allow update: if isValidId(truckId) && (isAdmin() || isDocOwner()) && isValidTruck(incoming(), truckId) && hasValidAuditUpdate() && (
+      allow update: if isValidId(truckId) && (isAdmin() || isDocOwner() || isSharedMember(existing())) && isValidTruck(incoming(), truckId) && hasValidAuditUpdate() && (
         isAdmin() ||
-        incoming().diff(existing()).affectedKeys().hasOnly([
-          'code', 'plateNumber', 'model', 'maxCapacityLiters', 'currentWaterLiters',
-          'driverId', 'driverName', 'driverPhone', 'status', 'lastLat', 'lastLng',
-          'lastSpeed', 'lastUpdateTimestamp', 'lastEvent', 'currentTripId', 'odometerKm',
-          'serverUpdatedAt'
-        ])
+        (
+          isDocOwner() &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'code', 'plateNumber', 'model', 'maxCapacityLiters', 'currentWaterLiters',
+            'driverId', 'driverName', 'driverPhone', 'status', 'lastLat', 'lastLng',
+            'lastSpeed', 'lastUpdateTimestamp', 'lastEvent', 'currentTripId', 'odometerKm',
+            'serverUpdatedAt'
+          ])
+        ) ||
+        (
+          isSharedMember(existing()) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'currentWaterLiters', 'status', 'lastLat', 'lastLng',
+            'lastSpeed', 'lastUpdateTimestamp', 'lastEvent', 'currentTripId', 'odometerKm',
+            'serverUpdatedAt'
+          ])
+        )
       );
       allow delete: if isValidId(truckId) && (isAdmin() || isDocOwner());
     }
 
     match /driverAccounts/{accountId} {
-      allow get: if isValidId(accountId) && (isAdmin() || isDocOwner());
-      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow get: if isValidId(accountId) && (isAdmin() || isDocOwner() || isSharedMember(existing()));
+      allow list: if isBootstrappedAdmin();
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSharedMemberList(resource.data);
       allow create: if isValidId(accountId) && isSignedIn() && isValidDriverAccount(incoming(), accountId) && hasValidAuditCreate(incoming()) && (isAdmin() || incoming().status == 'pending');
-      allow update: if isValidId(accountId) && (isAdmin() || isDocOwner()) && isValidDriverAccount(incoming(), accountId) && hasValidAuditUpdate() && (
+      allow update: if isValidId(accountId) && (isAdmin() || isDocOwner() || isSharedMember(existing())) && isValidDriverAccount(incoming(), accountId) && hasValidAuditUpdate() && (
         isAdmin() ||
-        incoming().diff(existing()).affectedKeys().hasOnly([
-          'name', 'username', 'phone', 'password', 'licenseNumber', 'lastLoginAt', 'serverUpdatedAt'
-        ])
+        (
+          isDocOwner() &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'username', 'phone', 'password', 'googleEmail', 'licenseNumber', 'lastLoginAt', 'serverUpdatedAt'
+          ])
+        ) ||
+        (
+          isSharedMember(existing()) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['lastLoginAt', 'serverUpdatedAt'])
+        )
       );
       allow delete: if isValidId(accountId) && (isAdmin() || isDocOwner());
     }
 
     match /customers/{customerId} {
-      allow get: if isValidId(customerId) && (isAdmin() || isDocOwner());
-      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow get: if isValidId(customerId) && (isAdmin() || isDocOwner() || isSharedMember(existing()));
+      allow list: if isBootstrappedAdmin();
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSharedMemberList(resource.data);
       allow create: if isValidId(customerId) && isSignedIn() && isValidCustomer(incoming(), customerId) && hasValidAuditCreate(incoming());
       allow update: if isValidId(customerId) && (isAdmin() || isDocOwner()) && isValidCustomer(incoming(), customerId) && hasValidAuditUpdate() && (
         isAdmin() ||
@@ -678,12 +687,15 @@ service cloud.firestore {
     }
 
     match /orders/{orderId} {
-      allow get: if isValidId(orderId) && (isAdmin() || isDocOwner());
-      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow get: if isValidId(orderId) && (isAdmin() || isDocOwner() || isSharedMember(existing()));
+      allow list: if isBootstrappedAdmin();
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSharedMemberList(resource.data);
       allow create: if isValidId(orderId) && isSignedIn() && isValidOrder(incoming(), orderId) && hasValidAuditCreate(incoming());
-      allow update: if isValidId(orderId) && (isAdmin() || isDocOwner()) && isValidOrder(incoming(), orderId) && hasValidAuditUpdate() && (
+      allow update: if isValidId(orderId) && (isAdmin() || isDocOwner() || isSharedMember(existing())) && isValidOrder(incoming(), orderId) && hasValidAuditUpdate() && (
         isAdmin() ||
         (
+          isDocOwner() &&
           existing().status != 'delivered' && existing().status != 'cancelled' &&
           incoming().diff(existing()).affectedKeys().hasOnly([
             'orderNumber', 'customerId', 'customerName', 'phone', 'district',
@@ -692,18 +704,26 @@ service cloud.firestore {
             'notes', 'status', 'tripId', 'isUrgent', 'duplicateWarning',
             'duplicateMatchedOrderId', 'serverUpdatedAt'
           ])
+        ) ||
+        (
+          isSharedMember(existing()) &&
+          existing().status != 'delivered' && existing().status != 'cancelled' &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'serverUpdatedAt'])
         )
       );
       allow delete: if isValidId(orderId) && (isAdmin() || isDocOwner());
     }
 
     match /trips/{tripId} {
-      allow get: if isValidId(tripId) && (isAdmin() || isDocOwner());
-      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow get: if isValidId(tripId) && (isAdmin() || isDocOwner() || isSharedMember(existing()));
+      allow list: if isBootstrappedAdmin();
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSharedMemberList(resource.data);
       allow create: if isValidId(tripId) && isSignedIn() && isValidTrip(incoming(), tripId) && hasValidAuditCreate(incoming());
-      allow update: if isValidId(tripId) && (isAdmin() || isDocOwner()) && isValidTrip(incoming(), tripId) && hasValidAuditUpdate() && (
+      allow update: if isValidId(tripId) && isSignedIn() && isValidTrip(incoming(), tripId) && hasValidAuditUpdate() && (
         isAdmin() ||
         (
+          isDocOwner() &&
           existing().status != 'closed' &&
           incoming().diff(existing()).affectedKeys().hasOnly([
             'initialLoadLiters', 'deliveredLiters', 'remainingLiters', 'status', 'syncStatus',
@@ -719,6 +739,18 @@ service cloud.firestore {
             'actualCost', 'expectedRevenue', 'actualRevenue', 'expectedProfit',
             'actualProfit', 'profitMarginPercent', 'capacityUtilizationPercent',
             'departureRecommendation', 'recommendationReason', 'notes', 'serverUpdatedAt'
+          ])
+        ) ||
+        (
+          isSharedMember(existing()) &&
+          existing().status != 'closed' &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'deliveredLiters', 'remainingLiters', 'status', 'syncStatus',
+            'driverAcceptanceStatus', 'driverRespondedAt', 'driverResponseReason',
+            'customerStops', 'startedAt', 'startLocation', 'returnedToPlantAt',
+            'returnLocation', 'completedAt', 'lastSyncedAt', 'gpsPoints', 'detectedStops',
+            'gpsGaps', 'movingMinutes', 'stoppedMinutes', 'auditLogs', 'modificationRequests',
+            'actualDistanceKm', 'actualFuelLiters', 'fuelCost', 'actualCost', 'serverUpdatedAt'
           ])
         )
       );
@@ -762,8 +794,10 @@ service cloud.firestore {
     }
 
     match /gpsEvents/{eventId} {
-      allow get: if isValidId(eventId) && (isAdmin() || isDocOwner());
-      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow get: if isValidId(eventId) && (isAdmin() || isDocOwner() || isSharedMember(existing()));
+      allow list: if isBootstrappedAdmin();
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSharedMemberList(resource.data);
       allow create: if isValidId(eventId) && isSignedIn() && isValidGpsEvent(incoming(), eventId) && hasValidAuditCreate(incoming());
       allow update: if isValidId(eventId) && (isAdmin() || isDocOwner()) && isValidGpsEvent(incoming(), eventId) && hasValidAuditUpdate() && (
         isAdmin() ||
@@ -773,10 +807,12 @@ service cloud.firestore {
     }
 
     match /notifications/{notificationId} {
-      allow get: if isValidId(notificationId) && (isAdmin() || isDocOwner());
-      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow get: if isValidId(notificationId) && (isAdmin() || isDocOwner() || isSharedMember(existing()));
+      allow list: if isBootstrappedAdmin();
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSharedMemberList(resource.data);
       allow create: if isValidId(notificationId) && isSignedIn() && isValidNotification(incoming(), notificationId) && hasValidAuditCreate(incoming());
-      allow update: if isValidId(notificationId) && (isAdmin() || isDocOwner()) && isValidNotification(incoming(), notificationId) && hasValidAuditUpdate() && (
+      allow update: if isValidId(notificationId) && (isAdmin() || isDocOwner() || isSharedMember(existing())) && isValidNotification(incoming(), notificationId) && hasValidAuditUpdate() && (
         isAdmin() ||
         incoming().diff(existing()).affectedKeys().hasOnly(['isRead', 'serverUpdatedAt'])
       );
@@ -784,10 +820,12 @@ service cloud.firestore {
     }
 
     match /directives/{directiveId} {
-      allow get: if isValidId(directiveId) && (isAdmin() || isDocOwner());
-      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow get: if isValidId(directiveId) && (isAdmin() || isDocOwner() || isSharedMember(existing()));
+      allow list: if isBootstrappedAdmin();
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSharedMemberList(resource.data);
       allow create: if isValidId(directiveId) && isSignedIn() && isValidDirective(incoming(), directiveId) && hasValidAuditCreate(incoming());
-      allow update: if isValidId(directiveId) && (isAdmin() || isDocOwner()) && isValidDirective(incoming(), directiveId) && hasValidAuditUpdate() && (
+      allow update: if isValidId(directiveId) && (isAdmin() || isDocOwner() || isSharedMember(existing())) && isValidDirective(incoming(), directiveId) && hasValidAuditUpdate() && (
         isAdmin() ||
         (
           existing().status != 'completed' &&
@@ -798,8 +836,10 @@ service cloud.firestore {
     }
 
     match /tripStateLogs/{logId} {
-      allow get: if isValidId(logId) && (isAdmin() || isDocOwner());
-      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow get: if isValidId(logId) && (isAdmin() || isDocOwner() || isSharedMember(existing()));
+      allow list: if isBootstrappedAdmin();
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSharedMemberList(resource.data);
       allow create: if isValidId(logId) && isSignedIn() && isValidTripStateLog(incoming(), logId) && hasValidAuditCreate(incoming()) && (isAdmin() || incoming().reviewedByManager == false);
       allow update: if isValidId(logId) && (isAdmin() || isDocOwner()) && isValidTripStateLog(incoming(), logId) && hasValidAuditUpdate() &&
         incoming().tripId == existing().tripId &&

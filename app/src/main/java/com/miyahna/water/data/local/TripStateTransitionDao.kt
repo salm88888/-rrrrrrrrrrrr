@@ -40,6 +40,9 @@ interface TripStateTransitionDao {
     @Query("UPDATE trip_state_transitions SET isSyncedToCloud = 1 WHERE isSyncedToCloud = 0")
     suspend fun markAllTransitionsSynced()
 
+    @Query("DELETE FROM trip_state_transitions WHERE tripId = :tripId")
+    suspend fun deleteTransitionsForTrip(tripId: String)
+
     @Query("DELETE FROM trip_state_transitions")
     suspend fun clearAllTransitions()
 }

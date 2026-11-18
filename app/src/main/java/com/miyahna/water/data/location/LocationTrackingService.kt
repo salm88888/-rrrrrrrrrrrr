@@ -6,14 +6,17 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.Sensor
 import android.hardware.SensorManager
 import android.hardware.TriggerEvent
 import android.hardware.TriggerEventListener
+import android.location.LocationManager
 import android.os.Build
 import android.os.IBinder
 import android.os.Looper
@@ -21,6 +24,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationAvailability
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
@@ -74,6 +78,19 @@ class LocationTrackingService : Service() {
     internal val currentPowerSaveMode: GpsTrackingMode
         get() = powerSavePolicy.currentMode()
 
+    @Volatile
+    private var lastKnownDeviceGpsEnabled: Boolean = true
+
+    private val gpsProviderReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == LocationManager.PROVIDERS_CHANGED_ACTION ||
+                intent?.action == LocationManager.MODE_CHANGED_ACTION
+            ) {
+                handleDeviceGpsStateChanged(DeviceLocationHelper.isDeviceGpsEnabled(this@LocationTrackingService))
+            }
+        }
+    }
+
     private val significantMotionListener = object : TriggerEventListener() {
         override fun onTrigger(event: TriggerEvent?) {
             isSignificantMotionArmed = false
@@ -92,6 +109,14 @@ class LocationTrackingService : Service() {
             sensorManager?.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
         }.getOrNull()
         ensureNotificationChannel()
+        val filter = IntentFilter(LocationManager.PROVIDERS_CHANGED_ACTION).apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                addAction(LocationManager.MODE_CHANGED_ACTION)
+            }
+        }
+        runCatching {
+            ContextCompat.registerReceiver(this, gpsProviderReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -175,9 +200,21 @@ class LocationTrackingService : Service() {
             return START_NOT_STICKY
         }
 
-        val initialTitle = getString(R.string.tracking_notification_title)
-        val initialText = getString(R.string.tracking_notification_text)
-        if (!promoteToForeground(buildNotification(title = initialTitle, text = initialText))) {
+        val gpsEnabledNow = DeviceLocationHelper.isDeviceGpsEnabled(this)
+        lastKnownDeviceGpsEnabled = gpsEnabledNow
+        repo?.setDeviceGpsEnabled(gpsEnabledNow)
+
+        val initialTitle = if (gpsEnabledNow) {
+            getString(R.string.tracking_notification_title)
+        } else {
+            getString(R.string.gps_disabled_notification_title)
+        }
+        val initialText = if (gpsEnabledNow) {
+            getString(R.string.tracking_notification_text)
+        } else {
+            getString(R.string.gps_disabled_notification_text)
+        }
+        if (!promoteToForeground(buildNotification(title = initialTitle, text = initialText, urgent = !gpsEnabledNow))) {
             disarmSignificantMotionTrigger()
             LocationTrackingPrefs.setPowerSaveActiveNow(this, false)
             repo?.setBackgroundGpsActive(false)
@@ -267,7 +304,7 @@ class LocationTrackingService : Service() {
         }.getOrDefault(false)
     }
 
-    private fun buildNotification(title: String, text: String): Notification {
+    private fun buildNotification(title: String, text: String, urgent: Boolean = false): Notification {
         val openIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
@@ -283,10 +320,68 @@ class LocationTrackingService : Service() {
             .setContentTitle(title)
             .setContentText(text)
             .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOnlyAlertOnce(!urgent)
+            .setPriority(if (urgent) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_LOW)
             .setContentIntent(pending)
             .build()
+    }
+
+    private fun refreshForegroundNotification() {
+        val repo = (application as? MiyahnaApplication)?.repository
+        val state = repo?.state?.value
+        val gpsEnabledNow = DeviceLocationHelper.isDeviceGpsEnabled(this)
+        val activeTrip = state?.trips?.firstOrNull {
+            it.status == TripStatus.IN_PROGRESS || it.status == TripStatus.PAUSED
+        }
+        val readyTrip = state?.trips?.firstOrNull {
+            it.status == TripStatus.APPROVED && it.driverAcceptanceStatus == "accepted"
+        } ?: state?.trips?.firstOrNull { it.status == TripStatus.APPROVED }
+        val tripNumber = activeTrip?.tripNumber ?: readyTrip?.tripNumber
+        val netLabel = if (state?.isOnline != false) "متصل" else "تخزين محلي"
+
+        val title = when {
+            !gpsEnabledNow -> getString(R.string.gps_disabled_notification_title)
+            tripNumber != null -> "مياهنا — رحلة $tripNumber"
+            else -> getString(R.string.tracking_notification_title)
+        }
+        val text = when {
+            !gpsEnabledNow -> getString(R.string.gps_disabled_notification_text)
+            else -> "${getString(R.string.tracking_notification_text)} · $netLabel"
+        }
+        val nm = getSystemService(NotificationManager::class.java)
+        runCatching {
+            nm?.notify(NOTIFICATION_ID, buildNotification(title, text, urgent = !gpsEnabledNow))
+        }
+    }
+
+    private fun handleDeviceGpsStateChanged(gpsEnabled: Boolean) {
+        val prev = lastKnownDeviceGpsEnabled
+        lastKnownDeviceGpsEnabled = gpsEnabled
+        val repo = (application as? MiyahnaApplication)?.repository
+        repo?.setDeviceGpsEnabled(gpsEnabled)
+        refreshForegroundNotification()
+
+        if (!prev && gpsEnabled && locationCallback != null) {
+            val mode = powerSavePolicy.currentMode()
+            val config = powerSavePolicy.updateConfig(
+                buildPolicyConfig(
+                    settings = repo?.state?.value?.settings,
+                    activeIntervalSeconds = LocationTrackingPrefs.getSampleIntervalSeconds(this),
+                    powerSaveEnabled = LocationTrackingPrefs.isPowerSaveEnabled(this),
+                    powerSaveIntervalSeconds = LocationTrackingPrefs.getPowerSaveIntervalSeconds(this),
+                    stationaryDwellSeconds = LocationTrackingPrefs.getStationaryDwellSeconds(this),
+                    hasFinePermission = ContextCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.ACCESS_FINE_LOCATION
+                    ) == PackageManager.PERMISSION_GRANTED
+                )
+            )
+            startLocationUpdates(
+                intervalSeconds = if (mode == GpsTrackingMode.ACTIVE) LocationTrackingPrefs.getSampleIntervalSeconds(this) else config.effectiveIntervalSeconds,
+                useHighAccuracy = mode == GpsTrackingMode.ACTIVE,
+                fetchImmediateFix = true
+            )
+        }
     }
 
     private fun observeRepositoryForNotificationUpdates() {
@@ -304,18 +399,8 @@ class LocationTrackingService : Service() {
                     Pair(activeTrip?.tripNumber ?: readyTrip?.tripNumber, s.isOnline)
                 }
                 .distinctUntilChanged()
-                .collect { (tripNumber, isOnline) ->
-                    val netLabel = if (isOnline) "متصل" else "عمل محلي"
-                    val title = if (tripNumber != null) {
-                        "مياهنا — رحلة $tripNumber"
-                    } else {
-                        getString(R.string.tracking_notification_title)
-                    }
-                    val text = "${getString(R.string.tracking_notification_text)} · $netLabel"
-                    val nm = getSystemService(NotificationManager::class.java)
-                    runCatching {
-                        nm?.notify(NOTIFICATION_ID, buildNotification(title, text))
-                    }
+                .collect {
+                    refreshForegroundNotification()
                 }
         }
     }
@@ -496,6 +581,9 @@ class LocationTrackingService : Service() {
         val callback = object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
                 val loc = result.lastLocation ?: return
+                if (!lastKnownDeviceGpsEnabled) {
+                    handleDeviceGpsStateChanged(true)
+                }
                 handleLocationSample(
                     lat = loc.latitude,
                     lng = loc.longitude,
@@ -503,6 +591,13 @@ class LocationTrackingService : Service() {
                     accuracy = if (loc.hasAccuracy()) loc.accuracy.toDouble() else null,
                     timestampMs = loc.time.takeIf { it > 0L } ?: System.currentTimeMillis()
                 )
+            }
+
+            override fun onLocationAvailability(availability: LocationAvailability) {
+                val deviceEnabled = DeviceLocationHelper.isDeviceGpsEnabled(this@LocationTrackingService)
+                if (deviceEnabled != lastKnownDeviceGpsEnabled) {
+                    handleDeviceGpsStateChanged(deviceEnabled)
+                }
             }
         }
         locationCallback = callback
@@ -613,6 +708,7 @@ class LocationTrackingService : Service() {
 
     override fun onDestroy() {
         val repo = (application as? MiyahnaApplication)?.repository
+        runCatching { unregisterReceiver(gpsProviderReceiver) }
         disarmSignificantMotionTrigger()
         LocationTrackingPrefs.setPowerSaveActiveNow(this, false)
         repo?.setBackgroundGpsActive(false)

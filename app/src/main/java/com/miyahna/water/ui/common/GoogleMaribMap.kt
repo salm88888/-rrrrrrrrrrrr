@@ -56,14 +56,17 @@ import com.google.maps.android.compose.Marker
 import com.google.maps.android.compose.MarkerState
 import com.google.maps.android.compose.Polyline
 import com.google.maps.android.compose.rememberCameraPositionState
+import android.graphics.Bitmap
 import com.miyahna.water.R
 import com.miyahna.water.domain.Customer
 import com.miyahna.water.domain.DetectedStop
+import com.miyahna.water.domain.GPSEvent
+import com.miyahna.water.domain.GPSGap
+import com.miyahna.water.domain.Order
 import com.miyahna.water.domain.PlantLocation
 import com.miyahna.water.domain.TripCustomerStop
 import com.miyahna.water.domain.TripGPSPoint
 import com.miyahna.water.domain.Truck
-import com.miyahna.water.domain.TruckStatus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -136,6 +139,7 @@ fun GoogleMaribMap(
     plantLocation: PlantLocation,
     geofenceMeters: Int,
     customers: List<Customer>,
+    orders: List<Order> = emptyList(),
     resolvedTrucks: List<Truck>,
     selectedTruckId: String?,
     onTruckSelected: ((String) -> Unit)?,
@@ -144,6 +148,8 @@ fun GoogleMaribMap(
     plannedStops: List<TripCustomerStop>,
     gpsPoints: List<TripGPSPoint>,
     detectedStops: List<DetectedStop>,
+    gpsGaps: List<GPSGap> = emptyList(),
+    gpsOffEvents: List<GPSEvent> = emptyList(),
     pickedPoint: Pair<Double, Double>?,
     onMapTapPick: ((Double, Double) -> Unit)?,
     onMapsUnavailable: ((String) -> Unit)? = null,
@@ -164,8 +170,8 @@ fun GoogleMaribMap(
         }
     }
 
-    val safePlantLat = if (isValidCoordinate(plantLocation.lat, plantLocation.lng)) plantLocation.lat else 15.4920
-    val safePlantLng = if (isValidCoordinate(plantLocation.lat, plantLocation.lng)) plantLocation.lng else 45.3620
+    val safePlantLat = if (isValidCoordinate(plantLocation.lat, plantLocation.lng)) plantLocation.lat else 15.4698538
+    val safePlantLng = if (isValidCoordinate(plantLocation.lat, plantLocation.lng)) plantLocation.lng else 45.3636985
     val plantLatLng = remember(safePlantLat, safePlantLng) {
         LatLng(safePlantLat, safePlantLng)
     }
@@ -251,26 +257,45 @@ fun GoogleMaribMap(
                 strokeWidth = 3f
             )
 
+            val factoryIcon = rememberSafeBitmapIcon(isMapLoaded, "factory") {
+                MapMarkerIcons.factoryBitmap(context)
+            }
             Marker(
                 state = rememberSyncedMarkerState("plant", plantLatLng),
                 title = plantLocation.name.ifBlank { "مصنع مياهنا" },
                 snippet = "${plantLocation.city} • نطاق السياج ${geofenceMeters}م",
-                icon = rememberSafeMarkerHue(isMapLoaded, BitmapDescriptorFactory.HUE_AZURE)
+                icon = factoryIcon
             )
 
-            // Registered Customers
+            // Registered Customers (Red tank when ordering, Gray tank in normal state)
             if (showCustomers) {
+                val activeOrders = remember(orders) { MapMarkerIcons.activeOrdersFrom(orders) }
+                val activeCustomerIds = remember(orders, plannedStops) {
+                    MapMarkerIcons.activeCustomerIds(orders, plannedStops)
+                }
                 val validCustomers = remember(customers) {
                     customers.filter { isValidCoordinate(it.lat, it.lng) }.distinctBy { it.id }
                 }
+                val normalTankIcon = rememberSafeBitmapIcon(isMapLoaded, "tank_normal") {
+                    MapMarkerIcons.customerTankBitmap(context, isOrdering = false)
+                }
+                val orderingTankIcon = rememberSafeBitmapIcon(isMapLoaded, "tank_ordering") {
+                    MapMarkerIcons.customerTankBitmap(context, isOrdering = true)
+                }
                 validCustomers.forEachIndexed { idx, customer ->
+                    val isOrdering = MapMarkerIcons.isCustomerOrdering(
+                        customer = customer,
+                        activeCustomerIds = activeCustomerIds,
+                        activeOrders = activeOrders,
+                        plannedStops = plannedStops
+                    )
                     key("cust_${customer.id}_$idx") {
                         val pos = LatLng(customer.lat, customer.lng)
                         Marker(
                             state = rememberSyncedMarkerState("cust_${customer.id}_$idx", pos),
-                            title = customer.name,
+                            title = if (isOrdering) "${customer.name} (لديه طلب)" else customer.name,
                             snippet = "${customer.district} • ${customer.tankCapacityLiters} لتر",
-                            icon = rememberSafeMarkerHue(isMapLoaded, BitmapDescriptorFactory.HUE_CYAN)
+                            icon = if (isOrdering) orderingTankIcon else normalTankIcon
                         )
                     }
                 }
@@ -321,7 +346,24 @@ fun GoogleMaribMap(
                 )
             }
 
-            // Prolonged / Unplanned Detected Stops
+            // Key Timing & Speed Checkpoints
+            val speedCheckpoints = remember(gpsPoints) { MapMarkerIcons.sampleSpeedCheckpoints(gpsPoints) }
+            speedCheckpoints.forEachIndexed { idx, pt ->
+                val speedVal = pt.speedKmH.safeRoundToInt()
+                key("spd_${pt.id}_$idx") {
+                    val spdIcon = rememberSafeBitmapIcon(isMapLoaded, "spd_$speedVal") {
+                        MapMarkerIcons.speedCheckpointBitmap(context, speedVal)
+                    }
+                    Marker(
+                        state = rememberSyncedMarkerState("spd_${pt.id}_$idx", LatLng(pt.lat, pt.lng)),
+                        title = "نقطة #${pt.seq} • ${safeShortTime(pt.timestamp)}",
+                        snippet = "السرعة: $speedVal كم/س • ${formatLatLng(pt.lat, pt.lng, 5)}",
+                        icon = spdIcon
+                    )
+                }
+            }
+
+            // Prolonged / Unplanned Detected Stops (Locations + Durations)
             val validDetectedStops = remember(detectedStops) {
                 detectedStops.filter { isValidCoordinate(it.lat, it.lng) }
             }
@@ -332,12 +374,57 @@ fun GoogleMaribMap(
                     } else {
                         BitmapDescriptorFactory.HUE_GREEN
                     }
-                    val label = if (stop.isUnplannedStop) "توقف غير مخطط" else "نقطة توقف"
+                    val label = when {
+                        stop.isUnplannedStop -> "توقف غير مجدول #${idx + 1}"
+                        !stop.nearCustomerName.isNullOrBlank() -> "توقف: ${stop.nearCustomerName}"
+                        else -> "توقف في نطاق المصنع #${idx + 1}"
+                    }
+                    val endLabel = stop.endTime?.let { safeShortTime(it) } ?: "مستمر"
                     Marker(
                         state = rememberSyncedMarkerState("det_${stop.id}_${stop.startTime}_$idx", LatLng(stop.lat, stop.lng)),
                         title = label,
-                        snippet = "المدة: ${stop.durationMinutes} دقيقة",
+                        snippet = "المدة: ${stop.durationMinutes} د · من ${safeShortTime(stop.startTime)} إلى $endLabel",
                         icon = rememberSafeMarkerHue(isMapLoaded, hue)
+                    )
+                }
+            }
+
+            // GPS Off / Interruption Segments & Notes
+            val gpsOffIcon = rememberSafeBitmapIcon(isMapLoaded, "gps_off") {
+                MapMarkerIcons.gpsOffPinBitmap(context)
+            }
+            gpsGaps.forEachIndexed { idx, gap ->
+                val fromOk = gap.fromLat != null && gap.fromLng != null && isValidCoordinate(gap.fromLat, gap.fromLng)
+                val toOk = gap.toLat != null && gap.toLng != null && isValidCoordinate(gap.toLat, gap.toLng)
+                if (fromOk && toOk) {
+                    Polyline(
+                        points = listOf(LatLng(gap.fromLat!!, gap.fromLng!!), LatLng(gap.toLat!!, gap.toLng!!)),
+                        color = Color(0xFFDC2626),
+                        width = 7f,
+                        pattern = listOf(Dash(16f), Gap(10f))
+                    )
+                }
+                val markerLat = if (fromOk) gap.fromLat else if (toOk) gap.toLat else null
+                val markerLng = if (fromOk) gap.fromLng else if (toOk) gap.toLng else null
+                if (markerLat != null && markerLng != null) {
+                    key("gap_${gap.id}_$idx") {
+                        val durLabel = if (gap.durationSeconds >= 60) "${gap.durationSeconds / 60} د" else "${gap.durationSeconds} ث"
+                        Marker(
+                            state = rememberSyncedMarkerState("gap_${gap.id}_$idx", LatLng(markerLat, markerLng)),
+                            title = "إيقاف / انقطاع GPS",
+                            snippet = "${MapMarkerIcons.gpsGapReasonAr(gap.reason)} · $durLabel · ${safeShortTime(gap.startTime)} - ${safeShortTime(gap.endTime)}",
+                            icon = gpsOffIcon
+                        )
+                    }
+                }
+            }
+            gpsOffEvents.filter { isValidCoordinate(it.lat, it.lng) }.forEachIndexed { idx, ev ->
+                key("gpsoff_${ev.id}_$idx") {
+                    Marker(
+                        state = rememberSyncedMarkerState("gpsoff_${ev.id}_$idx", LatLng(ev.lat, ev.lng)),
+                        title = ev.customerName ?: "ملاحظة إيقاف GPS",
+                        snippet = "${ev.eventType.labelAr} · ${safeShortTime(ev.timestamp)}",
+                        icon = gpsOffIcon
                     )
                 }
             }
@@ -349,13 +436,10 @@ fun GoogleMaribMap(
             validTrucks.forEachIndexed { idx, truck ->
                 key("truck_${truck.id}_$idx") {
                     val truckPos = LatLng(truck.lastLat, truck.lastLng)
-                    val hue = when (truck.status) {
-                        TruckStatus.ON_TRIP -> BitmapDescriptorFactory.HUE_BLUE
-                        TruckStatus.LOADING -> BitmapDescriptorFactory.HUE_ORANGE
-                        TruckStatus.IDLE -> BitmapDescriptorFactory.HUE_GREEN
-                        TruckStatus.MAINTENANCE -> BitmapDescriptorFactory.HUE_ROSE
-                    }
                     val isSelected = selectedTruckId != null && truck.id == selectedTruckId
+                    val truckIcon = rememberSafeBitmapIcon(isMapLoaded, "truck_${truck.status.name}_$isSelected") {
+                        MapMarkerIcons.tankerTruckBitmap(context, truck.status, isSelected)
+                    }
                     val speedText = if (truck.lastSpeed.isFinite() && truck.lastSpeed >= 1.0) {
                         " • ${truck.lastSpeed.safeRoundToInt()} كم/س"
                     } else ""
@@ -363,8 +447,8 @@ fun GoogleMaribMap(
                         state = rememberSyncedMarkerState("truck_${truck.id}_$idx", truckPos),
                         title = "${truck.code} (${truck.plateNumber})",
                         snippet = "${truck.driverName.ifBlank { "بدون سائق" }}$speedText • ${truck.currentWaterLiters} لتر",
-                        alpha = if (selectedTruckId == null || isSelected) 1f else 0.78f,
-                        icon = rememberSafeMarkerHue(isMapLoaded, hue),
+                        alpha = if (selectedTruckId == null || isSelected) 1f else 0.84f,
+                        icon = truckIcon,
                         onClick = {
                             onTruckSelected?.invoke(truck.id)
                             false
@@ -507,5 +591,17 @@ private fun rememberSafeMarkerHue(isMapLoaded: Boolean, hue: Float): BitmapDescr
     return remember(isMapLoaded, hue) {
         if (!isMapLoaded) null
         else runCatching { BitmapDescriptorFactory.defaultMarker(hue) }.getOrNull()
+    }
+}
+
+@Composable
+private fun rememberSafeBitmapIcon(
+    isMapLoaded: Boolean,
+    cacheKey: String,
+    bitmapBuilder: () -> Bitmap
+): BitmapDescriptor? {
+    return remember(isMapLoaded, cacheKey) {
+        if (!isMapLoaded) null
+        else runCatching { BitmapDescriptorFactory.fromBitmap(bitmapBuilder()) }.getOrNull()
     }
 }

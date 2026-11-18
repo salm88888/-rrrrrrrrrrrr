@@ -56,8 +56,7 @@ enum class ManagerTab(val labelAr: String) {
 
 enum class DriverTab(val labelAr: String) {
     TRIP("الرحلة"),
-    GPS_FUEL("الوقود والتسليم"),
-    FIELD_ORDER("طلب ميداني"),
+    FIELD_ORDER("الطلبات"),
     SYNC("المزامنة")
 }
 
@@ -73,6 +72,7 @@ data class MiyahnaUiState(
     val isCapturingDeliveryLocation: Boolean = false,
     val isBackgroundGpsActive: Boolean = false,
     val isGpsPowerSaveActive: Boolean = false,
+    val isDeviceGpsEnabled: Boolean = true,
     val unsyncedGpsPointsCount: Int = 0,
     val fleetFilterCriteria: FleetFilterCriteria = FleetFilterCriteria(),
     val allFleetTrucks: List<Truck> = emptyList(),
@@ -86,6 +86,7 @@ private data class TrackingIndicatorsState(
     val isCapturingDeliveryLocation: Boolean = false,
     val isBackgroundGpsActive: Boolean = false,
     val isGpsPowerSaveActive: Boolean = false,
+    val isDeviceGpsEnabled: Boolean = true,
     val unsyncedGpsPointsCount: Int = 0
 )
 
@@ -120,19 +121,28 @@ class MiyahnaViewModel(application: Application) : AndroidViewModel(application)
         repo.observeCustomers(query)
     }
 
+    private val gpsStatusFlow = combine(
+        repo.isBackgroundGpsActive,
+        repo.isGpsPowerSaveActive,
+        repo.isDeviceGpsEnabled,
+        repo.observeUnsyncedGpsPointsCount()
+    ) { bgActive, powerSaveActive, deviceGps, unsyncedPts ->
+        TrackingIndicatorsState(
+            isBackgroundGpsActive = bgActive,
+            isGpsPowerSaveActive = powerSaveActive,
+            isDeviceGpsEnabled = deviceGps,
+            unsyncedGpsPointsCount = unsyncedPts
+        )
+    }
+
     private val trackingIndicatorsFlow = combine(
         repo.observeDeliveryLocations(),
         repo.isCapturingDeliveryLocation,
-        repo.isBackgroundGpsActive,
-        repo.isGpsPowerSaveActive,
-        repo.observeUnsyncedGpsPointsCount()
-    ) { logs, capturing, bgActive, powerSaveActive, unsyncedPts ->
-        TrackingIndicatorsState(
+        gpsStatusFlow
+    ) { logs, capturing, gpsStatus ->
+        gpsStatus.copy(
             deliveryLocations = logs,
-            isCapturingDeliveryLocation = capturing,
-            isBackgroundGpsActive = bgActive,
-            isGpsPowerSaveActive = powerSaveActive,
-            unsyncedGpsPointsCount = unsyncedPts
+            isCapturingDeliveryLocation = capturing
         )
     }
 
@@ -197,6 +207,7 @@ class MiyahnaViewModel(application: Application) : AndroidViewModel(application)
             isCapturingDeliveryLocation = tracking.isCapturingDeliveryLocation,
             isBackgroundGpsActive = tracking.isBackgroundGpsActive,
             isGpsPowerSaveActive = tracking.isGpsPowerSaveActive,
+            isDeviceGpsEnabled = tracking.isDeviceGpsEnabled,
             unsyncedGpsPointsCount = tracking.unsyncedGpsPointsCount,
             fleetFilterCriteria = fleetControl.criteria,
             allFleetTrucks = allTrucks,
@@ -284,6 +295,17 @@ class MiyahnaViewModel(application: Application) : AndroidViewModel(application)
         return ok
     }
 
+    fun enterManagerDirectly() {
+        viewModelScope.launch { repo.selectRole(AppRole.MANAGER) }
+    }
+
+    fun lockManagerSession() {
+        viewModelScope.launch {
+            repo.lockManagerSession()
+            emitToast("تم قفل دخول الإدارة برمز PIN")
+        }
+    }
+
     fun enterDriverPortal() {
         viewModelScope.launch { repo.selectRole(AppRole.DRIVER) }
     }
@@ -339,14 +361,58 @@ class MiyahnaViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch { repo.toggleSuspendDriverAccount(driverId) }
     }
 
+    fun createDriverByManager(
+        name: String,
+        username: String,
+        phone: String,
+        password: String,
+        googleEmail: String?,
+        licenseNumber: String?,
+        onResult: (ActionResult<*>) -> Unit
+    ) {
+        viewModelScope.launch {
+            val res = repo.createDriverAccountByManager(
+                name = name,
+                username = username,
+                phone = phone,
+                password = password,
+                googleEmail = googleEmail,
+                licenseNumber = licenseNumber
+            )
+            if (res.success) {
+                emitToast("تمت إضافة واعتماد السائق ${res.data?.name ?: ""}")
+            } else {
+                emitToast(res.error ?: "تعذر إضافة السائق")
+            }
+            onResult(res)
+        }
+    }
+
+    fun updateDriverGoogleEmail(driverId: String, email: String) {
+        viewModelScope.launch {
+            val res = repo.updateDriverGoogleEmail(driverId, email)
+            if (res.success) {
+                emitToast("تم تحديث بريد Google للسائق")
+            } else {
+                emitToast(res.error ?: "تعذر تحديث بريد Google")
+            }
+        }
+    }
+
     fun signInCloudWithGoogle(activityContext: Context) {
         viewModelScope.launch {
             val res = repo.signInCloudWithGoogle(activityContext)
             if (res.success) {
-                emitToast("تم ربط السحابة بحساب ${res.data?.email}")
+                emitToast("تم ربط Firebase بحساب ${res.data?.email}")
             } else {
                 emitToast(res.error ?: "تعذر ربط حساب Google")
             }
+        }
+    }
+
+    fun attemptCloudAutoSignIn(activityContext: Context) {
+        viewModelScope.launch {
+            repo.attemptCloudAutoSignIn(activityContext)
         }
     }
 
@@ -394,7 +460,8 @@ class MiyahnaViewModel(application: Application) : AndroidViewModel(application)
         lat: Double,
         lng: Double,
         tankCapacityLiters: Int,
-        notes: String?
+        notes: String?,
+        isActive: Boolean? = null
     ) {
         viewModelScope.launch {
             val res = repo.updateCustomer(
@@ -407,7 +474,8 @@ class MiyahnaViewModel(application: Application) : AndroidViewModel(application)
                 lat = lat,
                 lng = lng,
                 tankCapacityLiters = tankCapacityLiters,
-                notes = notes
+                notes = notes,
+                isActive = isActive
             )
             emitToast(if (res.success) "تم تحديث بيانات العميل" else (res.error ?: "تعذر تحديث العميل"))
         }
@@ -441,9 +509,9 @@ class MiyahnaViewModel(application: Application) : AndroidViewModel(application)
                 lat, lng, tankCapacity, requestedLiters, pricePerLiter, source, isUrgent, notes
             )
             if (res.warning) {
-                emitToast("تم تسجيل الطلب (تنبيه: يوجد طلب حديث لنفس العميل خلال 6 ساعات)")
+                emitToast("تم تسجيل الطلب وحفظ العميل (تنبيه: يوجد طلب حديث لنفس العميل خلال 6 ساعات)")
             } else {
-                emitToast("تم تسجيل الطلب بنجاح")
+                emitToast("تم تسجيل الطلب وحفظ العميل بنجاح")
             }
         }
     }
@@ -485,6 +553,13 @@ class MiyahnaViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             repo.closeTripAfterReview(tripId, notes)
             emitToast("تم اعتماد المراجعة وإغلاق الرحلة")
+        }
+    }
+
+    fun deleteTrip(tripId: String) {
+        viewModelScope.launch {
+            val res = repo.deleteTrip(tripId)
+            emitToast(if (res.success) "تم حذف الرحلة بنجاح" else (res.error ?: "تعذر حذف الرحلة"))
         }
     }
 
@@ -554,6 +629,10 @@ class MiyahnaViewModel(application: Application) : AndroidViewModel(application)
 
     fun ensureDriverBackgroundGpsRunning() {
         repo.ensureDriverBackgroundGpsRunning()
+    }
+
+    fun setDeviceGpsEnabled(enabled: Boolean) {
+        repo.setDeviceGpsEnabled(enabled)
     }
 
     fun requestTripModification(tripId: String, stops: List<TripCustomerStop>, reason: String) {

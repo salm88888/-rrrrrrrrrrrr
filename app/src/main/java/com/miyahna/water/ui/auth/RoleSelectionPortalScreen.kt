@@ -1,6 +1,5 @@
 package com.miyahna.water.ui.auth
 
-import android.app.Activity
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
@@ -11,6 +10,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -22,15 +22,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.CloudDone
-import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.LocalShipping
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.WaterDrop
-import androidx.compose.material.icons.filled.Wifi
-import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
@@ -49,7 +47,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -60,6 +57,7 @@ import androidx.compose.ui.unit.dp
 import com.miyahna.water.R
 import com.miyahna.water.data.cloud.CloudUserInfo
 import com.miyahna.water.ui.common.StatusPill
+import com.miyahna.water.ui.theme.AmberWarning
 import com.miyahna.water.ui.theme.EmeraldAccent
 import com.miyahna.water.ui.theme.RoseError
 import com.miyahna.water.ui.theme.SkyPrimary
@@ -72,7 +70,10 @@ fun RoleSelectionPortalScreen(
     onVerifyManagerPin: (String) -> Boolean,
     onSelectDriver: () -> Unit,
     onCloudSignIn: () -> Unit,
-    onCloudSignOut: () -> Unit
+    onCloudSignOut: () -> Unit,
+    isManagerUnlocked: Boolean = false,
+    hasSavedDriverSession: Boolean = false,
+    onEnterManagerDirectly: () -> Unit = {}
 ) {
     var showPinDialog by remember { mutableStateOf(false) }
     var pinInput by remember { mutableStateOf("") }
@@ -89,18 +90,17 @@ fun RoleSelectionPortalScreen(
         ) {
             Column(
                 modifier = Modifier
-                    .widthIn(max = 580.dp)
+                    .widthIn(max = 560.dp)
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 20.dp, vertical = 24.dp),
+                    .padding(horizontal = 20.dp, vertical = 20.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // Brand Identity Card
                 Surface(
                     shape = RoundedCornerShape(22.dp),
                     color = SkyPrimary,
                     shadowElevation = 4.dp,
-                    modifier = Modifier.size(84.dp)
+                    modifier = Modifier.size(76.dp)
                 ) {
                     Image(
                         painter = painterResource(id = R.drawable.miyahna_launcher_icon),
@@ -111,7 +111,7 @@ fun RoleSelectionPortalScreen(
                     )
                 }
 
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(12.dp))
                 Text(
                     text = stringResource(R.string.portal_title),
                     style = MaterialTheme.typography.headlineLarge,
@@ -124,7 +124,7 @@ fun RoleSelectionPortalScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(12.dp))
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -135,26 +135,103 @@ fun RoleSelectionPortalScreen(
                         contentColor = if (isOnline) EmeraldAccent else RoseError
                     )
                     StatusPill(
-                        label = if (cloudUser != null) "سحابة: ${cloudUser.email}" else "تخزين محلي Room",
-                        containerColor = MaterialTheme.colorScheme.primaryContainer,
-                        contentColor = MaterialTheme.colorScheme.primary
+                        label = if (cloudUser != null) "Firebase متصل" else "Firebase غير مربوط",
+                        containerColor = if (cloudUser != null) EmeraldAccent.copy(alpha = 0.14f) else AmberWarning.copy(alpha = 0.15f),
+                        contentColor = if (cloudUser != null) EmeraldAccent else AmberWarning
                     )
                 }
 
-                Spacer(modifier = Modifier.height(22.dp))
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Prominent Firebase Cloud Connection Card
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (cloudUser != null) {
+                            EmeraldAccent.copy(alpha = 0.08f)
+                        } else {
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                        }
+                    ),
+                    border = BorderStroke(
+                        1.dp,
+                        if (cloudUser != null) EmeraldAccent.copy(alpha = 0.45f) else SkyPrimary.copy(alpha = 0.45f)
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (cloudUser != null) Icons.Default.CloudDone else Icons.Default.CloudUpload,
+                            contentDescription = "حالة Firebase",
+                            tint = if (cloudUser != null) EmeraldAccent else SkyPrimary,
+                            modifier = Modifier.size(26.dp)
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = if (cloudUser != null) {
+                                    "سحابة Firebase Firestore نشطة"
+                                } else {
+                                    "ربط قاعدة بيانات Firebase السحابية"
+                                },
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = if (cloudUser != null) {
+                                    cloudUser.email
+                                } else {
+                                    "سجّل بحساب Google لمزامنة الطلبات والرحلات لحظياً"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        if (cloudUser != null) {
+                            TextButton(
+                                onClick = onCloudSignOut,
+                                modifier = Modifier
+                                    .heightIn(min = 48.dp)
+                                    .testTag("cloud_signout_button")
+                            ) {
+                                Text("فصل")
+                            }
+                        } else {
+                            Button(
+                                onClick = onCloudSignIn,
+                                enabled = isOnline,
+                                modifier = Modifier
+                                    .heightIn(min = 48.dp)
+                                    .testTag("cloud_signin_google_button")
+                            ) {
+                                Text("ربط الآن")
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
 
                 // Manager Card
                 Card(
                     onClick = {
-                        pinInput = ""
-                        pinError = null
-                        showPinDialog = true
+                        if (isManagerUnlocked) {
+                            onEnterManagerDirectly()
+                        } else {
+                            pinInput = ""
+                            pinError = null
+                            showPinDialog = true
+                        }
                     },
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("select_manager_role_card"),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    border = BorderStroke(1.5.dp, SkyPrimary.copy(alpha = 0.35f))
+                    border = BorderStroke(1.5.dp, SkyPrimary.copy(alpha = 0.4f))
                 ) {
                     Row(
                         modifier = Modifier.padding(18.dp),
@@ -170,7 +247,7 @@ fun RoleSelectionPortalScreen(
                                 tint = SkyPrimary,
                                 modifier = Modifier
                                     .padding(14.dp)
-                                    .size(30.dp)
+                                    .size(28.dp)
                             )
                         }
                         Spacer(modifier = Modifier.width(14.dp))
@@ -184,9 +261,16 @@ fun RoleSelectionPortalScreen(
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold
                                 )
+                                if (isManagerUnlocked) {
+                                    StatusPill(
+                                        label = "دخول محفوظ",
+                                        containerColor = EmeraldAccent.copy(alpha = 0.14f),
+                                        contentColor = EmeraldAccent
+                                    )
+                                }
                                 if (pendingDriversCount > 0) {
                                     StatusPill(
-                                        label = "$pendingDriversCount طلب سائق",
+                                        label = "$pendingDriversCount سائق",
                                         containerColor = RoseError.copy(alpha = 0.15f),
                                         contentColor = RoseError
                                     )
@@ -194,20 +278,20 @@ fun RoleSelectionPortalScreen(
                             }
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = stringResource(R.string.role_manager_desc),
+                                text = "إدارة الطلبات، الرحلات، الأسطول، والمالية بسهولة",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                         Icon(
-                            imageVector = Icons.Default.Lock,
-                            contentDescription = "محمي برمز PIN",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            imageVector = if (isManagerUnlocked) Icons.Default.LockOpen else Icons.Default.Lock,
+                            contentDescription = if (isManagerUnlocked) "الدخول محفوظ تلقائياً" else "محمي برمز PIN",
+                            tint = if (isManagerUnlocked) EmeraldAccent else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
 
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(12.dp))
 
                 // Driver Card
                 Card(
@@ -216,7 +300,7 @@ fun RoleSelectionPortalScreen(
                         .fillMaxWidth()
                         .testTag("select_driver_role_card"),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    border = BorderStroke(1.5.dp, EmeraldAccent.copy(alpha = 0.35f))
+                    border = BorderStroke(1.5.dp, EmeraldAccent.copy(alpha = 0.4f))
                 ) {
                     Row(
                         modifier = Modifier.padding(18.dp),
@@ -232,16 +316,28 @@ fun RoleSelectionPortalScreen(
                                 tint = EmeraldAccent,
                                 modifier = Modifier
                                     .padding(14.dp)
-                                    .size(30.dp)
+                                    .size(28.dp)
                             )
                         }
                         Spacer(modifier = Modifier.width(14.dp))
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = stringResource(R.string.role_driver_title),
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = stringResource(R.string.role_driver_title),
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                if (hasSavedDriverSession) {
+                                    StatusPill(
+                                        label = "دخول محفوظ",
+                                        containerColor = EmeraldAccent.copy(alpha = 0.14f),
+                                        contentColor = EmeraldAccent
+                                    )
+                                }
+                            }
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
                                 text = stringResource(R.string.role_driver_desc),
@@ -254,62 +350,6 @@ fun RoleSelectionPortalScreen(
                             contentDescription = null,
                             tint = EmeraldAccent
                         )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(20.dp))
-
-                // Google Cloud Sync Connection Card
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
-                ) {
-                    Column(modifier = Modifier.padding(14.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = if (cloudUser != null) Icons.Default.CloudDone else Icons.Default.CloudOff,
-                                contentDescription = "حالة السحابة",
-                                tint = if (cloudUser != null) EmeraldAccent else MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = if (cloudUser != null) {
-                                    "المزامنة السحابية مفعلة (${cloudUser.displayName})"
-                                } else {
-                                    "ربط المزامنة السحابية عبر حساب Google (اختياري للعمل بين الأجهزة)"
-                                },
-                                style = MaterialTheme.typography.bodyMedium,
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(10.dp))
-                        if (cloudUser != null) {
-                            OutlinedButton(
-                                onClick = onCloudSignOut,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("cloud_signout_button")
-                            ) {
-                                Text(stringResource(R.string.cloud_signout))
-                            }
-                        } else {
-                            Button(
-                                onClick = onCloudSignIn,
-                                enabled = isOnline,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("cloud_signin_google_button")
-                            ) {
-                                Icon(
-                                    imageVector = if (isOnline) Icons.Default.Wifi else Icons.Default.WifiOff,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(stringResource(R.string.cloud_signin_google))
-                            }
-                        }
                     }
                 }
             }

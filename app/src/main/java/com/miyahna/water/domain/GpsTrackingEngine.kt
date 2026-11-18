@@ -57,6 +57,7 @@ data class TripCompletionReadiness(
     val elapsedSeconds: Long,
     val departureThresholdMeters: Int,
     val geofenceRadius: Int,
+    val currentDistanceFromPlantMeters: Int = 0,
     val reason: String
 )
 
@@ -345,32 +346,17 @@ object GpsTrackingEngine {
         candidateReturnAccuracy: Double? = null
     ): TripCompletionReadiness {
         val geofenceRadius = max(60, settings.plantGeofenceMeters)
-        val departureThresholdMeters = max((geofenceRadius * 3.5).safeRoundToInt(), 450)
+        val departureThresholdMeters = geofenceRadius
         val stopVisitRadiusMeters = max(settings.stopRadiusMeters, 100)
-        val minNearbyCustomerOriginMeters = max((geofenceRadius * 1.5).safeRoundToInt(), 180)
+        val minNearbyCustomerOriginMeters = max(geofenceRadius / 2, 120)
         val maxAllowedAccuracy = max(settings.gpsWeakAccuracyMeters.toDouble(), 80.0)
 
         val analysis = analyzeGpsTrack(trip.id, points, trip.customerStops, settings)
         val analyzedPoints = analysis.points
-        val firstReliable = analyzedPoints.firstOrNull { it.accuracy == null || it.accuracy <= maxAllowedAccuracy }
-
-        val startInsidePlant = trip.startLocation != null &&
-            isWithinPlantGeofence(trip.startLocation.lat, trip.startLocation.lng, settings).inside
-        val anchorToStart = trip.id.startsWith("trip-auto-") || startInsidePlant
-        val originLat = when {
-            anchorToStart && trip.startLocation != null -> trip.startLocation.lat
-            !anchorToStart && firstReliable != null -> firstReliable.lat
-            trip.startLocation != null -> trip.startLocation.lat
-            else -> settings.plantLocation.lat
-        }
-        val originLng = when {
-            anchorToStart && trip.startLocation != null -> trip.startLocation.lng
-            !anchorToStart && firstReliable != null -> firstReliable.lng
-            trip.startLocation != null -> trip.startLocation.lng
-            else -> settings.plantLocation.lng
-        }
-
         val reliablePoints = analyzedPoints.filter { it.accuracy == null || it.accuracy <= maxAllowedAccuracy }
+
+        val originLat = trip.startLocation?.lat ?: settings.plantLocation.lat
+        val originLng = trip.startLocation?.lng ?: settings.plantLocation.lng
 
         val startMs = listOfNotNull(
             parseEpochMillis(trip.startedAt).takeIf { it > 0L },
@@ -380,6 +366,7 @@ object GpsTrackingEngine {
             ?: System.currentTimeMillis()
         val elapsedSeconds = max(0L, (latestMs - startMs) / 1000L)
 
+        var maxDistanceFromPlant = 0.0
         var maxDistanceFromOrigin = 0.0
         var consecutiveOutside = 0
         var departureConfirmIdx = -1
@@ -391,11 +378,12 @@ object GpsTrackingEngine {
             val distOrigin = haversineDistanceMeters(pt.lat, pt.lng, originLat, originLng)
             val distPlant = haversineDistanceMeters(pt.lat, pt.lng, settings.plantLocation.lat, settings.plantLocation.lng)
             if (distOrigin > maxDistanceFromOrigin) maxDistanceFromOrigin = distOrigin
+            if (distPlant > maxDistanceFromPlant) maxDistanceFromPlant = distPlant
 
-            val outside = distOrigin >= departureThresholdMeters && distPlant >= departureThresholdMeters
+            val outside = distPlant > geofenceRadius
             if (outside) {
                 consecutiveOutside++
-                if (consecutiveOutside >= 2 && departureConfirmIdx == -1) {
+                if ((consecutiveOutside >= 2 || distPlant >= geofenceRadius + 50.0) && departureConfirmIdx == -1) {
                     departureConfirmIdx = i
                 }
             } else {
@@ -417,55 +405,71 @@ object GpsTrackingEngine {
         }
 
         val hasDeparted = departureConfirmIdx != -1
-        val postDeparture = if (hasDeparted) reliablePoints.drop(departureConfirmIdx + 1) else emptyList()
-
-        fun insideReturn(lat: Double, lng: Double): Boolean {
-            val dOrigin = haversineDistanceMeters(lat, lng, originLat, originLng)
-            val dPlant = haversineDistanceMeters(lat, lng, settings.plantLocation.lat, settings.plantLocation.lng)
-            return dOrigin <= geofenceRadius || dPlant <= geofenceRadius
-        }
-
-        var consecutiveReturnHits = 0
-        if (postDeparture.size >= 2) {
-            val lastTwo = postDeparture.takeLast(2)
-            if (lastTwo.all { insideReturn(it.lat, it.lng) }) {
-                consecutiveReturnHits = 2
+        val trailingCandidate = candidateReturnLocation
+            ?.takeIf { candidateReturnAccuracy == null || candidateReturnAccuracy <= maxAllowedAccuracy }
+            ?.let { (cLat, cLng) ->
+                val last = reliablePoints.lastOrNull()
+                val alreadyIncluded = last != null &&
+                    haversineDistanceMeters(last.lat, last.lng, cLat, cLng) < 1.0
+                if (alreadyIncluded) null else cLat to cLng
             }
-        } else if (postDeparture.size == 1 &&
-            candidateReturnLocation != null &&
-            (candidateReturnAccuracy == null || candidateReturnAccuracy <= maxAllowedAccuracy)
-        ) {
-            if (insideReturn(postDeparture[0].lat, postDeparture[0].lng) &&
-                insideReturn(candidateReturnLocation.first, candidateReturnLocation.second)
-            ) {
-                consecutiveReturnHits = 2
+
+        val postDeparture = buildList {
+            if (hasDeparted) {
+                reliablePoints.drop(departureConfirmIdx + 1).forEach { pt ->
+                    add(Triple(pt.lat, pt.lng, pt.speedKmH))
+                }
+                trailingCandidate?.let { (cLat, cLng) ->
+                    add(Triple(cLat, cLng, 0.0))
+                }
             }
         }
 
-        val hasConfirmedReturn = consecutiveReturnHits >= 2
+        fun distanceToPlant(lat: Double, lng: Double): Double =
+            haversineDistanceMeters(lat, lng, settings.plantLocation.lat, settings.plantLocation.lng)
+
+        val latestPoint = postDeparture.lastOrNull()
+            ?: reliablePoints.lastOrNull()?.let { Triple(it.lat, it.lng, it.speedKmH) }
+            ?: trailingCandidate?.let { Triple(it.first, it.second, 0.0) }
+        val currentDistanceFromPlantMeters = latestPoint?.let { (lat, lng, _) ->
+            distanceToPlant(lat, lng).safeRoundToInt()
+        } ?: Int.MAX_VALUE
+
+        val latestPost = postDeparture.lastOrNull()
+        val prevPost = postDeparture.dropLast(1).lastOrNull()
+        val hasConfirmedReturn = if (latestPost != null) {
+            val latestDist = distanceToPlant(latestPost.first, latestPost.second)
+            val prevInside = prevPost != null && distanceToPlant(prevPost.first, prevPost.second) <= geofenceRadius
+            latestDist <= geofenceRadius && (
+                prevInside ||
+                    latestDist <= (geofenceRadius * 0.8) ||
+                    latestPost.third < settings.minMovementSpeedKmH
+                )
+        } else {
+            false
+        }
+
         val filteredDistKm = analysis.totalDistanceKm
-        val minDistRequired = if (visitedCustomerStop) 0.3 else 0.8
-        val minDurationRequired = if (visitedCustomerStop) 60L else 120L
+        val minDistRequired = 0.25
+        val minDurationRequired = 20L
 
-        val hasSufficientTravel = (visitedCustomerStop &&
-            maxDistanceFromOrigin >= minNearbyCustomerOriginMeters &&
-            filteredDistKm >= minDistRequired) ||
-            (maxDistanceFromOrigin >= departureThresholdMeters &&
-                filteredDistKm >= minDistRequired)
+        val hasSufficientTravel = (visitedCustomerStop && filteredDistKm >= minDistRequired) ||
+            (maxDistanceFromPlant > geofenceRadius && filteredDistKm >= minDistRequired)
         val hasMinDuration = elapsedSeconds >= minDurationRequired
         val qualified = hasDeparted && hasSufficientTravel && hasMinDuration && hasConfirmedReturn
 
+        val maxObservedPlantMeters = max(maxDistanceFromOrigin, maxDistanceFromPlant).safeRoundToInt()
         val reason = when {
             !hasDeparted ->
-                "لم يبتعد الوايت عن نقطة الانطلاق بمسافة كافية بعد (أقصى مسافة: ${maxDistanceFromOrigin.safeRoundToInt()}م من أصل ${departureThresholdMeters}م)"
+                "لم يبتعد الوايت عن محيط المصنع بعد (أقصى مسافة: ${maxObservedPlantMeters}م من أصل ${departureThresholdMeters}م)"
             !hasSufficientTravel ->
                 "المسافة الفعلية المقطوعة غير كافية ($filteredDistKm كم من أصل $minDistRequired كم المطلوبة)"
             !hasMinDuration ->
                 "مدة الرحلة قصيرة جداً (${elapsedSeconds}ث من أصل ${minDurationRequired}ث المطلوبة)"
             !hasConfirmedReturn ->
-                "الوايت خارج نطاق العودة أو بانتظار تأكيد قراءتين متتاليتين داخل نقطة الانطلاق"
+                "الوايت خارج محيط المصنع (${geofenceRadius}م) — ستُسجل العودة وتُغلق الرحلة تلقائياً عند العودة"
             else ->
-                "اكتملت شروط الانطلاق الفعلي والعودة المؤكدة لنقطة الانطلاق"
+                "تم رصد العودة إلى محيط المصنع (${currentDistanceFromPlantMeters}م) وإغلاق الرحلة تلقائياً"
         }
 
         return TripCompletionReadiness(
@@ -473,11 +477,12 @@ object GpsTrackingEngine {
             hasDeparted = hasDeparted,
             hasConfirmedReturn = hasConfirmedReturn,
             visitedCustomerStop = visitedCustomerStop,
-            maxDistanceFromOriginMeters = maxDistanceFromOrigin.safeRoundToInt(),
+            maxDistanceFromOriginMeters = maxObservedPlantMeters,
             filteredDistanceKm = filteredDistKm,
             elapsedSeconds = elapsedSeconds,
             departureThresholdMeters = departureThresholdMeters,
             geofenceRadius = geofenceRadius,
+            currentDistanceFromPlantMeters = currentDistanceFromPlantMeters,
             reason = reason
         )
     }

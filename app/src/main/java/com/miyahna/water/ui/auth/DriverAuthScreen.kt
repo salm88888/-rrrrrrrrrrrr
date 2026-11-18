@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -19,8 +20,11 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.CloudDone
+import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.LocalShipping
 import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -50,7 +54,10 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.miyahna.water.R
 import com.miyahna.water.data.ActionResult
+import com.miyahna.water.data.cloud.CloudUserInfo
+import com.miyahna.water.ui.theme.AmberWarning
 import com.miyahna.water.ui.theme.EmeraldAccent
+import com.miyahna.water.ui.theme.RoseError
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -64,7 +71,10 @@ fun DriverAuthScreen(
         password: String,
         licenseNumber: String?,
         onResult: (ActionResult<*>) -> Unit
-    ) -> Unit
+    ) -> Unit,
+    isOnline: Boolean = true,
+    cloudUser: CloudUserInfo? = null,
+    onCloudSignIn: () -> Unit = {}
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
 
@@ -130,6 +140,69 @@ fun DriverAuthScreen(
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSecondaryContainer
                             )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Surface(
+                    color = MaterialTheme.colorScheme.surface,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(
+                        1.dp,
+                        when {
+                            !isOnline -> RoseError.copy(alpha = 0.45f)
+                            cloudUser != null -> EmeraldAccent.copy(alpha = 0.55f)
+                            else -> AmberWarning.copy(alpha = 0.6f)
+                        }
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = if (cloudUser != null && isOnline) Icons.Default.CloudDone else Icons.Default.CloudOff,
+                                contentDescription = "حالة الربط السحابي",
+                                tint = when {
+                                    !isOnline -> RoseError
+                                    cloudUser != null -> EmeraldAccent
+                                    else -> AmberWarning
+                                },
+                                modifier = Modifier.size(22.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "الربط السحابي المشترك (Google / Firebase)",
+                                    style = MaterialTheme.typography.titleSmall
+                                )
+                                Text(
+                                    text = when {
+                                        !isOnline -> "غير متصل بالإنترنت — ستُزامن البيانات تلقائياً عند توفر الشبكة"
+                                        cloudUser != null -> "متصل بالسحابة: ${cloudUser.email}"
+                                        else -> "سجّل بحساب Google المرتبط لدى المدير لاستلام الرحلات والطلبات مباشرة"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        if (cloudUser == null) {
+                            OutlinedButton(
+                                onClick = onCloudSignIn,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp)
+                                    .testTag("driver_auth_cloud_signin_button")
+                            ) {
+                                Icon(Icons.Default.CloudDone, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("ربط حساب Google للمزامنة")
+                            }
                         }
                     }
                 }
@@ -252,6 +325,14 @@ fun DriverAuthScreen(
                                 visualTransformation = PasswordVisualTransformation(),
                                 modifier = Modifier.fillMaxWidth()
                             )
+
+                            if (cloudUser != null) {
+                                Text(
+                                    text = "سيتم ربط الطلب تلقائياً ببريد Google: ${cloudUser.email}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = EmeraldAccent
+                                )
+                            }
 
                             regFeedback?.let { (ok, msg) ->
                                 Text(

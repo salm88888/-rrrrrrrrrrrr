@@ -92,6 +92,12 @@ object LocationTrackingPrefs {
     fun isPowerSaveActiveNow(context: Context): Boolean =
         prefs(context).getBoolean(KEY_POWER_SAVE_ACTIVE_NOW, false)
 
+    fun clearAcceptedTripId(context: Context) {
+        prefs(context).edit()
+            .remove(KEY_ACTIVE_ACCEPTED_TRIP_ID)
+            .apply()
+    }
+
     fun clear(context: Context) {
         prefs(context).edit()
             .putBoolean(KEY_PERSISTENT_TRACKING_ENABLED, false)

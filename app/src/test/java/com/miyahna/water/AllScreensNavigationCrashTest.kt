@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -14,7 +15,10 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeUp
 import androidx.test.core.app.ApplicationProvider
 import com.miyahna.water.data.ActionResult
 import com.miyahna.water.data.MiyahnaDomainState
@@ -114,16 +118,23 @@ class AllScreensNavigationCrashTest {
 
     @Test
     fun driverAuthScreen_switchesLoginAndRegisterTabs_withoutCrashing() {
+        var cloudSignInClicks = 0
         composeTestRule.setContent {
             MiyahnaTheme(darkDriverTheme = true) {
                 DriverAuthScreen(
                     onBackToPortal = {},
                     onLogin = { _, _, _ -> },
-                    onRegister = { _, _, _, _, _, cb -> cb(ActionResult<Unit>(true)) }
+                    onRegister = { _, _, _, _, _, cb -> cb(ActionResult<Unit>(true)) },
+                    isOnline = true,
+                    cloudUser = null,
+                    onCloudSignIn = { cloudSignInClicks++ }
                 )
             }
         }
         composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("driver_auth_cloud_signin_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        assert(cloudSignInClicks == 1)
         composeTestRule.onNodeWithTag("driver_login_identifier_input").performScrollTo().assertIsDisplayed()
         composeTestRule.onAllNodesWithText("طلب حساب سائق جديد").onFirst().performScrollTo().performClick()
         composeTestRule.waitForIdle()
@@ -187,9 +198,13 @@ class AllScreensNavigationCrashTest {
 
         currentTab = ManagerTab.TRIPS
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("open_all_transitions_log_button").performClick()
+        composeTestRule.onNodeWithTag("trips_lazy_column").performScrollToIndex(1)
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithText("إغلاق").performClick()
+        composeTestRule.onNodeWithTag("trips_lazy_column").performTouchInput { swipeUp() }
+        composeTestRule.waitForIdle()
+        composeTestRule.onAllNodesWithTag("inspect_trip_map_trip-dup").onFirst().performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("close_trip_review_dialog_button").performClick()
         composeTestRule.waitForIdle()
 
         // Header Notifications & Directive dialogs
@@ -201,6 +216,61 @@ class AllScreensNavigationCrashTest {
         composeTestRule.onNodeWithContentDescription("إرسال توجيه للسائق").performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithText("إلغاء").performClick()
+        composeTestRule.waitForIdle()
+    }
+
+    @Test
+    fun managerShell_bottomBarAndFirebaseActions_workSmoothlyWithoutCrashing() {
+        val stressState = buildStressUiState()
+        var currentTab by mutableStateOf(ManagerTab.OVERVIEW)
+        var cloudSignInClicks = 0
+
+        composeTestRule.setContent {
+            MiyahnaTheme {
+                ManagerShellScreen(
+                    uiState = stressState.copy(managerTab = currentTab),
+                    windowWidthSizeClass = WindowWidthSizeClass.Compact,
+                    viewModel = viewModel,
+                    onRequestCloudSignIn = { cloudSignInClicks++ }
+                )
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("manager_firebase_status_button").performClick()
+        composeTestRule.waitForIdle()
+        assert(cloudSignInClicks == 1)
+
+        composeTestRule.onNodeWithTag("overview_connect_firebase_button").performClick()
+        composeTestRule.waitForIdle()
+        assert(cloudSignInClicks == 2)
+
+        composeTestRule.onNodeWithTag("manager_nav_operations").performClick()
+        currentTab = ManagerTab.ORDERS
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("manager_subtab_trips").performClick()
+        currentTab = ManagerTab.TRIPS
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("manager_nav_map_fleet").performClick()
+        currentTab = ManagerTab.FLEET_LIVE
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("manager_subtab_map").performClick()
+        currentTab = ManagerTab.MAP
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("manager_nav_admin").performClick()
+        currentTab = ManagerTab.CUSTOMERS
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("manager_subtab_drivers").performScrollTo().performClick()
+        currentTab = ManagerTab.DRIVERS
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("add_driver_by_manager_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("إلغاء").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("manager_subtab_settings").performScrollTo().performClick()
+        currentTab = ManagerTab.SETTINGS
         composeTestRule.waitForIdle()
     }
 

@@ -26,8 +26,15 @@ class TripSyncWorker(
         val repo = (applicationContext as? MiyahnaApplication)?.repository
             ?: return Result.failure()
 
+        repo.awaitInitialized()
         val flushed = runCatching { repo.flushPendingOfflineQueue() }.getOrDefault(false)
-        return if (flushed) Result.success() else Result.retry()
+        if (!flushed) return Result.retry()
+
+        val state = repo.state.value
+        if (state.cloudUser != null && state.isOnline) {
+            runCatching { repo.syncWithCloud() }
+        }
+        return Result.success()
     }
 
     companion object {
@@ -50,7 +57,7 @@ class TripSyncWorker(
 
                 WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
                     UNIQUE_SYNC_WORK_NAME,
-                    ExistingWorkPolicy.REPLACE,
+                    ExistingWorkPolicy.KEEP,
                     request
                 )
             }

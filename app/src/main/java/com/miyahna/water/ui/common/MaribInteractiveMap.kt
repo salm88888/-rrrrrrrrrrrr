@@ -22,10 +22,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Factory
+import androidx.compose.material.icons.filled.LocalShipping
 import androidx.compose.material.icons.filled.Map
-import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material3.Button
@@ -54,15 +56,18 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -73,6 +78,9 @@ import com.miyahna.water.R
 import com.miyahna.water.domain.AlWadiDistricts
 import com.miyahna.water.domain.Customer
 import com.miyahna.water.domain.DetectedStop
+import com.miyahna.water.domain.GPSEvent
+import com.miyahna.water.domain.GPSGap
+import com.miyahna.water.domain.Order
 import com.miyahna.water.domain.PlantLocation
 import com.miyahna.water.domain.TripCustomerStop
 import com.miyahna.water.domain.TripGPSPoint
@@ -80,6 +88,7 @@ import com.miyahna.water.domain.Truck
 import com.miyahna.water.domain.TruckStatus
 import com.miyahna.water.ui.theme.NumericTextStyle
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 
 fun isGoogleMapsApiKeyConfigured(): Boolean {
     val key = BuildConfig.MAPS_API_KEY.trim()
@@ -88,16 +97,23 @@ fun isGoogleMapsApiKeyConfigured(): Boolean {
         !key.equals("null", ignoreCase = true)
 }
 
+private enum class MapEngineMode {
+    OSM,
+    VECTOR,
+    GOOGLE
+}
+
 /**
- * Interactive Marib / Al-Wadi District map supporting native Google Maps Compose
- * (when MAPS_API_KEY is configured and Play Services are available)
- * and a crash-safe offline-capable vector map mode.
+ * Interactive Marib / Al-Wadi map powered primarily by real open-source OpenStreetMap (OSMDroid)
+ * with satellite/topo tile layers, offline vector fallback, smooth pan/zoom/focus controls,
+ * and custom Factory, Water Tanker Truck, and Red/Gray Customer Tank markers.
  */
 @Composable
 fun MaribInteractiveMap(
     plantLocation: PlantLocation,
     geofenceMeters: Int,
     customers: List<Customer> = emptyList(),
+    orders: List<Order> = emptyList(),
     truck: Truck? = null,
     trucks: List<Truck> = emptyList(),
     selectedTruckId: String? = null,
@@ -107,26 +123,40 @@ fun MaribInteractiveMap(
     plannedStops: List<TripCustomerStop> = emptyList(),
     gpsPoints: List<TripGPSPoint> = emptyList(),
     detectedStops: List<DetectedStop> = emptyList(),
+    gpsGaps: List<GPSGap> = emptyList(),
+    gpsOffEvents: List<GPSEvent> = emptyList(),
     pickedPoint: Pair<Double, Double>? = null,
     onMapTapPick: ((Double, Double) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
-    val hasMapsKey = remember { isGoogleMapsApiKeyConfigured() }
-    val missingKeyHint = stringResource(R.string.maps_key_missing_hint)
-    var useGoogleMaps by remember(hasMapsKey) { mutableStateOf(hasMapsKey) }
-    var unavailableReason by remember { mutableStateOf<String?>(null) }
-    var dismissKeyBanner by remember { mutableStateOf(false) }
+    val hasGoogleMapsKey = remember { isGoogleMapsApiKeyConfigured() }
+    var engineMode by remember { mutableStateOf(MapEngineMode.OSM) }
 
     val resolvedTrucks = remember(truck, trucks) {
         if (trucks.isNotEmpty()) trucks else listOfNotNull(truck)
     }
 
+    val activeOrders = remember(orders) { MapMarkerIcons.activeOrdersFrom(orders) }
+    val activeCustomerIds = remember(orders, plannedStops) {
+        MapMarkerIcons.activeCustomerIds(orders, plannedStops)
+    }
+    val validCustomers = remember(customers) {
+        customers.filter { isValidLatLng(it.lat, it.lng) }.distinctBy { it.id }
+    }
+    val orderingCount = remember(validCustomers, activeCustomerIds, activeOrders, plannedStops) {
+        validCustomers.count {
+            MapMarkerIcons.isCustomerOrdering(it, activeCustomerIds, activeOrders, plannedStops)
+        }
+    }
+    val normalCount = (validCustomers.size - orderingCount).coerceAtLeast(0)
+
     Box(modifier = modifier.clipToBounds()) {
-        if (useGoogleMaps && hasMapsKey) {
-            GoogleMaribMap(
+        when (engineMode) {
+            MapEngineMode.OSM -> OsmMaribMap(
                 plantLocation = plantLocation,
                 geofenceMeters = geofenceMeters,
                 customers = customers,
+                orders = orders,
                 resolvedTrucks = resolvedTrucks,
                 selectedTruckId = selectedTruckId,
                 onTruckSelected = onTruckSelected,
@@ -135,20 +165,17 @@ fun MaribInteractiveMap(
                 plannedStops = plannedStops,
                 gpsPoints = gpsPoints,
                 detectedStops = detectedStops,
+                gpsGaps = gpsGaps,
+                gpsOffEvents = gpsOffEvents,
                 pickedPoint = pickedPoint,
                 onMapTapPick = onMapTapPick,
-                onMapsUnavailable = { reason ->
-                    unavailableReason = reason
-                    dismissKeyBanner = false
-                    useGoogleMaps = false
-                },
                 modifier = Modifier.fillMaxSize()
             )
-        } else {
-            OfflineVectorMaribMap(
+            MapEngineMode.GOOGLE -> GoogleMaribMap(
                 plantLocation = plantLocation,
                 geofenceMeters = geofenceMeters,
                 customers = customers,
+                orders = orders,
                 resolvedTrucks = resolvedTrucks,
                 selectedTruckId = selectedTruckId,
                 onTruckSelected = onTruckSelected,
@@ -157,120 +184,106 @@ fun MaribInteractiveMap(
                 plannedStops = plannedStops,
                 gpsPoints = gpsPoints,
                 detectedStops = detectedStops,
+                gpsGaps = gpsGaps,
+                gpsOffEvents = gpsOffEvents,
+                pickedPoint = pickedPoint,
+                onMapTapPick = onMapTapPick,
+                onMapsUnavailable = { engineMode = MapEngineMode.OSM },
+                modifier = Modifier.fillMaxSize()
+            )
+            MapEngineMode.VECTOR -> OfflineVectorMaribMap(
+                plantLocation = plantLocation,
+                geofenceMeters = geofenceMeters,
+                customers = customers,
+                orders = orders,
+                resolvedTrucks = resolvedTrucks,
+                selectedTruckId = selectedTruckId,
+                onTruckSelected = onTruckSelected,
+                showCustomers = showCustomers,
+                focusLatLng = focusLatLng,
+                plannedStops = plannedStops,
+                gpsPoints = gpsPoints,
+                detectedStops = detectedStops,
+                gpsGaps = gpsGaps,
+                gpsOffEvents = gpsOffEvents,
                 pickedPoint = pickedPoint,
                 onMapTapPick = onMapTapPick,
                 modifier = Modifier.fillMaxSize()
             )
         }
 
-        // Top-Start Map Engine Switcher & Secrets Key Hint
-        Column(
+        // Top-Start Map Engine Switcher (Real OSM Map default + Local Offline Vector fallback)
+        Surface(
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .padding(10.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            color = Color(0xFF0F172A).copy(alpha = 0.90f),
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, Color(0xFF334155))
         ) {
-            Surface(
-                color = Color(0xFF0F172A).copy(alpha = 0.88f),
-                shape = RoundedCornerShape(12.dp),
-                border = BorderStroke(1.dp, Color(0xFF334155))
+            Row(
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                FilterChip(
+                    selected = engineMode == MapEngineMode.OSM,
+                    onClick = { engineMode = MapEngineMode.OSM },
+                    leadingIcon = {
+                        Icon(Icons.Default.Public, contentDescription = null, modifier = Modifier.size(16.dp))
+                    },
+                    label = {
+                        Text(stringResource(R.string.map_mode_osm), style = MaterialTheme.typography.labelSmall)
+                    },
+                    modifier = Modifier.testTag("switch_osm_map_chip"),
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = Color(0xFF0EA5E9),
+                        selectedLabelColor = Color.White,
+                        selectedLeadingIconColor = Color.White,
+                        labelColor = Color(0xFFE2E8F0)
+                    )
+                )
+                FilterChip(
+                    selected = engineMode == MapEngineMode.VECTOR,
+                    onClick = { engineMode = MapEngineMode.VECTOR },
+                    leadingIcon = {
+                        Icon(Icons.Default.Map, contentDescription = null, modifier = Modifier.size(16.dp))
+                    },
+                    label = {
+                        Text(stringResource(R.string.map_mode_vector), style = MaterialTheme.typography.labelSmall)
+                    },
+                    modifier = Modifier.testTag("switch_vector_map_chip"),
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = Color(0xFF10B981),
+                        selectedLabelColor = Color.White,
+                        selectedLeadingIconColor = Color.White,
+                        labelColor = Color(0xFFE2E8F0)
+                    )
+                )
+                if (hasGoogleMapsKey) {
                     FilterChip(
-                        selected = useGoogleMaps,
-                        onClick = {
-                            if (!hasMapsKey) {
-                                dismissKeyBanner = false
-                                unavailableReason = missingKeyHint
-                                useGoogleMaps = false
-                            } else {
-                                unavailableReason = null
-                                useGoogleMaps = true
-                            }
-                        },
-                        leadingIcon = {
-                            Icon(Icons.Default.Public, contentDescription = null, modifier = Modifier.size(16.dp))
-                        },
+                        selected = engineMode == MapEngineMode.GOOGLE,
+                        onClick = { engineMode = MapEngineMode.GOOGLE },
                         label = {
                             Text(stringResource(R.string.map_mode_google), style = MaterialTheme.typography.labelSmall)
                         },
                         modifier = Modifier.testTag("switch_google_map_chip"),
                         colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = Color(0xFF0EA5E9),
+                            selectedContainerColor = Color(0xFF6366F1),
                             selectedLabelColor = Color.White,
-                            selectedLeadingIconColor = Color.White,
                             labelColor = Color(0xFFE2E8F0)
                         )
                     )
-                    FilterChip(
-                        selected = !useGoogleMaps,
-                        onClick = { useGoogleMaps = false },
-                        leadingIcon = {
-                            Icon(Icons.Default.Map, contentDescription = null, modifier = Modifier.size(16.dp))
-                        },
-                        label = {
-                            Text(stringResource(R.string.map_mode_vector), style = MaterialTheme.typography.labelSmall)
-                        },
-                        modifier = Modifier.testTag("switch_vector_map_chip"),
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = Color(0xFF10B981),
-                            selectedLabelColor = Color.White,
-                            selectedLeadingIconColor = Color.White,
-                            labelColor = Color(0xFFE2E8F0)
-                        )
-                    )
-                }
-            }
-
-            val bannerText = unavailableReason
-                ?: if (!hasMapsKey && !dismissKeyBanner) stringResource(R.string.maps_key_missing_hint) else null
-
-            if (bannerText != null) {
-                Surface(
-                    color = Color(0xFF1E293B).copy(alpha = 0.92f),
-                    shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f))
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Text(
-                            text = bannerText,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = Color(0xFFBAE6FD),
-                            modifier = Modifier.weight(1f, fill = false)
-                        )
-                        IconButton(
-                            onClick = {
-                                dismissKeyBanner = true
-                                unavailableReason = null
-                            },
-                            modifier = Modifier.size(28.dp)
-                        ) {
-                            Icon(
-                                Icons.Default.Close,
-                                contentDescription = "إخفاء التنبيه",
-                                tint = Color(0xFF94A3B8),
-                                modifier = Modifier.size(16.dp)
-                            )
-                        }
-                    }
                 }
             }
         }
 
-        // Legend Strip
+        // Legend Strip explaining Factory, Tanker Truck, and Red/Gray Customer Water Tanks
         Surface(
             modifier = Modifier
                 .align(Alignment.BottomStart)
                 .padding(10.dp),
-            color = Color(0xFF0F172A).copy(alpha = 0.88f),
+            color = Color(0xFF0F172A).copy(alpha = 0.90f),
             shape = RoundedCornerShape(10.dp),
             border = BorderStroke(1.dp, Color(0xFF334155))
         ) {
@@ -281,17 +294,21 @@ fun MaribInteractiveMap(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                LegendDot("المصنع", Color(0xFF38BDF8))
-                if (showCustomers && customers.isNotEmpty()) {
-                    LegendDot("عملاء (${customers.size})", Color(0xFF10B981))
+                LegendDot("المصنع", Color(0xFF0284C7))
+                LegendDot("الوايت (${resolvedTrucks.size})", Color(0xFF38BDF8))
+                if (showCustomers) {
+                    LegendDot("خزان أحمر: طلب ($orderingCount)", Color(0xFFEF4444))
+                    LegendDot("خزان رمادي: عادي ($normalCount)", Color(0xFF94A3B8))
                 }
-                LegendDot("في رحلة (${resolvedTrucks.count { it.status == TruckStatus.ON_TRIP }})", Color(0xFF0EA5E9))
-                LegendDot("تعبئة (${resolvedTrucks.count { it.status == TruckStatus.LOADING }})", Color(0xFFF59E0B))
-                LegendDot("متاح (${resolvedTrucks.count { it.status == TruckStatus.IDLE }})", Color(0xFF10B981))
-                if (resolvedTrucks.any { it.status == TruckStatus.MAINTENANCE }) {
-                    LegendDot("صيانة", Color(0xFFF43F5E))
+                if (gpsPoints.isNotEmpty()) {
+                    LegendDot("مسار وسرعة GPS", Color(0xFF22C55E))
                 }
-                if (gpsPoints.isNotEmpty()) LegendDot("مسار GPS", Color(0xFF22C55E))
+                if (detectedStops.isNotEmpty()) {
+                    LegendDot("توقفات (${detectedStops.size})", Color(0xFFF59E0B))
+                }
+                if (gpsGaps.isNotEmpty() || gpsOffEvents.isNotEmpty()) {
+                    LegendDot("إيقاف GPS (${gpsGaps.size + gpsOffEvents.size})", Color(0xFFDC2626))
+                }
             }
         }
     }
@@ -302,6 +319,7 @@ private fun OfflineVectorMaribMap(
     plantLocation: PlantLocation,
     geofenceMeters: Int,
     customers: List<Customer>,
+    orders: List<Order>,
     resolvedTrucks: List<Truck>,
     selectedTruckId: String?,
     onTruckSelected: ((String) -> Unit)?,
@@ -310,19 +328,61 @@ private fun OfflineVectorMaribMap(
     plannedStops: List<TripCustomerStop>,
     gpsPoints: List<TripGPSPoint>,
     detectedStops: List<DetectedStop>,
+    gpsGaps: List<GPSGap> = emptyList(),
+    gpsOffEvents: List<GPSEvent> = emptyList(),
     pickedPoint: Pair<Double, Double>?,
     onMapTapPick: ((Double, Double) -> Unit)?,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     var zoom by remember { mutableFloatStateOf(1.0f) }
     var panOffset by remember { mutableStateOf(Offset.Zero) }
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     val textMeasurer = rememberTextMeasurer()
 
-    val minLat = 15.4480
-    val maxLat = 15.5120
-    val minLng = 45.3350
-    val maxLng = 45.4220
+    val safePlantLat = if (isValidLatLng(plantLocation.lat, plantLocation.lng)) plantLocation.lat else 15.4698538
+    val safePlantLng = if (isValidLatLng(plantLocation.lat, plantLocation.lng)) plantLocation.lng else 45.3636985
+
+    // Compute dynamic viewport bounds covering Marib + active fleet/customers/stops
+    val (minLat, maxLat, minLng, maxLng) = remember(
+        safePlantLat,
+        safePlantLng,
+        customers,
+        resolvedTrucks,
+        plannedStops,
+        gpsPoints,
+        pickedPoint
+    ) {
+        val pts = buildList {
+            add(safePlantLat to safePlantLng)
+            resolvedTrucks.filter { isValidLatLng(it.lastLat, it.lastLng) }.forEach { add(it.lastLat to it.lastLng) }
+            customers.filter { isValidLatLng(it.lat, it.lng) }.forEach { add(it.lat to it.lng) }
+            plannedStops.filter { isValidLatLng(it.lat, it.lng) }.forEach { add(it.lat to it.lng) }
+            gpsPoints.filter { isValidLatLng(it.lat, it.lng) }.forEach { add(it.lat to it.lng) }
+            pickedPoint?.takeIf { isValidLatLng(it.first, it.second) }?.let { add(it) }
+        }
+        val loLat = (pts.minOfOrNull { it.first } ?: 15.45) - 0.014
+        val hiLat = (pts.maxOfOrNull { it.first } ?: 15.51) + 0.014
+        val loLng = (pts.minOfOrNull { it.second } ?: 45.34) - 0.018
+        val hiLng = (pts.maxOfOrNull { it.second } ?: 45.42) + 0.018
+        listOf(
+            minOf(loLat, 15.4480),
+            maxOf(hiLat, 15.5120),
+            minOf(loLng, 45.3350),
+            maxOf(hiLng, 45.4220)
+        )
+    }
+
+    val activeOrders = remember(orders) { MapMarkerIcons.activeOrdersFrom(orders) }
+    val activeCustomerIds = remember(orders, plannedStops) {
+        MapMarkerIcons.activeCustomerIds(orders, plannedStops)
+    }
+
+    val factoryImg = remember(context) { MapMarkerIcons.factoryBitmap(context).asImageBitmap() }
+    val normalTankImg = remember(context) { MapMarkerIcons.customerTankBitmap(context, false).asImageBitmap() }
+    val orderingTankImg = remember(context) { MapMarkerIcons.customerTankBitmap(context, true).asImageBitmap() }
+    val gpsOffImg = remember(context) { MapMarkerIcons.gpsOffPinBitmap(context).asImageBitmap() }
+    val pickedImg = remember(context) { MapMarkerIcons.pickedPinBitmap(context).asImageBitmap() }
 
     LaunchedEffect(focusLatLng, canvasSize) {
         val focus = focusLatLng
@@ -332,7 +392,7 @@ private fun OfflineVectorMaribMap(
             val center = Offset(w / 2f, h / 2f)
             val nx = ((focus.second - minLng) / (maxLng - minLng)).toFloat() * w
             val ny = ((maxLat - focus.first) / (maxLat - minLat)).toFloat() * h
-            val targetZoom = (if (zoom.isFinite()) zoom else 1f).coerceIn(1.35f, 4.5f)
+            val targetZoom = (if (zoom.isFinite()) zoom else 1f).coerceIn(1.5f, 4.5f)
             val targetX = -((nx - center.x) * targetZoom)
             val targetY = -((ny - center.y) * targetZoom)
             if (targetX.isFinite() && targetY.isFinite()) {
@@ -346,6 +406,11 @@ private fun OfflineVectorMaribMap(
         }
     }
 
+    val focusedTruck = remember(resolvedTrucks, selectedTruckId) {
+        val valid = resolvedTrucks.filter { isValidLatLng(it.lastLat, it.lastLng) }
+        valid.firstOrNull { it.id == selectedTruckId } ?: valid.firstOrNull()
+    }
+
     Box(
         modifier = modifier
             .background(Color(0xFF0F172A))
@@ -354,12 +419,12 @@ private fun OfflineVectorMaribMap(
                 detectTransformGestures { _, pan, gestureZoom, _ ->
                     val curZoom = if (zoom.isFinite() && zoom > 0f) zoom else 1f
                     val safeGestureZoom = if (gestureZoom.isFinite() && gestureZoom > 0f) gestureZoom else 1f
-                    zoom = (curZoom * safeGestureZoom).coerceIn(0.75f, 4.5f)
+                    zoom = (curZoom * safeGestureZoom).coerceIn(0.75f, 6.0f)
                     val safePanX = if (pan.x.isFinite()) pan.x else 0f
                     val safePanY = if (pan.y.isFinite()) pan.y else 0f
                     val baseX = if (panOffset.x.isFinite()) panOffset.x else 0f
                     val baseY = if (panOffset.y.isFinite()) panOffset.y else 0f
-                    val maxPan = 2500f * zoom
+                    val maxPan = 3000f * zoom
                     panOffset = Offset(
                         x = (baseX + safePanX).coerceIn(-maxPan, maxPan),
                         y = (baseY + safePanY).coerceIn(-maxPan, maxPan)
@@ -378,7 +443,7 @@ private fun OfflineVectorMaribMap(
                         val center = Offset(w / 2f, h / 2f)
                         if (onTruckSelected != null && resolvedTrucks.isNotEmpty()) {
                             var closestId: String? = null
-                            var bestDist = 52f
+                            var bestDist = 56f
                             resolvedTrucks.forEach { t ->
                                 if (isValidLatLng(t.lastLat, t.lastLng)) {
                                     val nx = ((t.lastLng - minLng) / (maxLng - minLng)).toFloat() * w
@@ -403,8 +468,8 @@ private fun OfflineVectorMaribMap(
                             val lng = minLng + (worldX / w) * (maxLng - minLng)
                             val lat = maxLat - (worldY / h) * (maxLat - minLat)
                             if (lat.isFinite() && lng.isFinite()) {
-                                val clampedLat = ((lat.coerceIn(15.35, 15.65)) * 1_000_000.0).safeRoundToInt() / 1_000_000.0
-                                val clampedLng = ((lng.coerceIn(45.20, 45.55)) * 1_000_000.0).safeRoundToInt() / 1_000_000.0
+                                val clampedLat = ((lat.coerceIn(15.20, 15.85)) * 1_000_000.0).safeRoundToInt() / 1_000_000.0
+                                val clampedLng = ((lng.coerceIn(45.05, 45.75)) * 1_000_000.0).safeRoundToInt() / 1_000_000.0
                                 onMapTapPick(clampedLat, clampedLng)
                             }
                         }
@@ -444,6 +509,12 @@ private fun OfflineVectorMaribMap(
                 }
             }
 
+            fun drawCenteredBitmap(img: androidx.compose.ui.graphics.ImageBitmap, pos: Offset) {
+                val topLeftX = (pos.x - img.width / 2f).roundToInt()
+                val topLeftY = (pos.y - img.height / 2f).roundToInt()
+                drawImage(image = img, dstOffset = IntOffset(topLeftX, topLeftY))
+            }
+
             val gridColor = Color(0xFF1E293B)
             for (i in 1..10) {
                 val x = (w / 10f) * i
@@ -474,8 +545,6 @@ private fun OfflineVectorMaribMap(
                 }
             }
 
-            val safePlantLat = if (isValidLatLng(plantLocation.lat, plantLocation.lng)) plantLocation.lat else 15.4920
-            val safePlantLng = if (isValidLatLng(plantLocation.lat, plantLocation.lng)) plantLocation.lng else 45.3620
             val plantPt = toScreen(safePlantLat, safePlantLng) ?: center
             val metersToPx = (w / ((maxLng - minLng).toFloat() * 107_000f)) * safeZoom
             val geofencePx = (geofenceMeters.coerceAtLeast(10) * metersToPx).coerceIn(18f, 160f)
@@ -486,19 +555,19 @@ private fun OfflineVectorMaribMap(
                 center = plantPt,
                 style = Stroke(width = 2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f)))
             )
-            drawCircle(Color(0xFF0284C7), radius = 10f, center = plantPt)
-            drawCircle(Color.White, radius = 4f, center = plantPt)
-            drawBoundedLabel(
-                text = "مصنع مياهنا",
-                topLeft = Offset(plantPt.x - 30f, plantPt.y + 12f),
-                style = TextStyle(color = Color(0xFF7DD3FC), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-            )
 
+            // Customers: Gray Water Tank normally, Red Water Tank when ordering
             if (showCustomers) {
-                customers.forEach { c ->
+                val (orderingCusts, normalCusts) = customers.partition { c ->
+                    MapMarkerIcons.isCustomerOrdering(c, activeCustomerIds, activeOrders, plannedStops)
+                }
+                normalCusts.forEach { c ->
                     val cp = toScreen(c.lat, c.lng) ?: return@forEach
-                    drawCircle(Color(0xFF10B981).copy(alpha = 0.85f), radius = 6f, center = cp)
-                    drawCircle(Color.White, radius = 2.2f, center = cp)
+                    drawCenteredBitmap(normalTankImg, cp)
+                }
+                orderingCusts.forEach { c ->
+                    val cp = toScreen(c.lat, c.lng) ?: return@forEach
+                    drawCenteredBitmap(orderingTankImg, cp)
                 }
             }
 
@@ -539,32 +608,71 @@ private fun OfflineVectorMaribMap(
                 )
             }
 
+            MapMarkerIcons.sampleSpeedCheckpoints(gpsPoints).forEach { pt ->
+                val sp = toScreen(pt.lat, pt.lng) ?: return@forEach
+                val spd = pt.speedKmH.safeRoundToInt()
+                drawCircle(Color(0xFF0284C7), radius = 10f, center = sp)
+                drawCircle(Color.White, radius = 10f, center = sp, style = Stroke(width = 1.6f))
+                drawBoundedLabel(
+                    text = "$spd كم/س · ${safeShortTime(pt.timestamp)}",
+                    topLeft = Offset(sp.x + 12f, sp.y - 8f),
+                    style = TextStyle(color = Color(0xFF7DD3FC), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                )
+            }
+
             detectedStops.forEach { stop ->
                 val dp = toScreen(stop.lat, stop.lng) ?: return@forEach
                 val c = if (stop.isUnplannedStop) Color(0xFFF43F5E) else Color(0xFF34D399)
                 drawCircle(c.copy(alpha = 0.28f), radius = 16f, center = dp)
                 drawCircle(c, radius = 6f, center = dp)
+                drawBoundedLabel(
+                    text = "${stop.durationMinutes} د",
+                    topLeft = Offset(dp.x + 10f, dp.y - 6f),
+                    style = TextStyle(color = c, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                )
             }
 
+            gpsGaps.forEach { gap ->
+                val fp = if (gap.fromLat != null && gap.fromLng != null) toScreen(gap.fromLat, gap.fromLng) else null
+                val tp = if (gap.toLat != null && gap.toLng != null) toScreen(gap.toLat, gap.toLng) else null
+                if (fp != null && tp != null) {
+                    drawLine(
+                        color = Color(0xFFDC2626),
+                        start = fp,
+                        end = tp,
+                        strokeWidth = 3.5f,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f))
+                    )
+                }
+                val markerPos = fp ?: tp
+                if (markerPos != null) {
+                    drawCenteredBitmap(gpsOffImg, markerPos)
+                    drawBoundedLabel(
+                        text = MapMarkerIcons.gpsGapReasonAr(gap.reason),
+                        topLeft = Offset(markerPos.x + 14f, markerPos.y - 8f),
+                        style = TextStyle(color = Color(0xFFFCA5A5), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    )
+                }
+            }
+            gpsOffEvents.forEach { ev ->
+                val ep = toScreen(ev.lat, ev.lng) ?: return@forEach
+                drawCenteredBitmap(gpsOffImg, ep)
+            }
+
+            // Custom Factory Icon at Plant Location
+            drawCenteredBitmap(factoryImg, plantPt)
+            drawBoundedLabel(
+                text = plantLocation.name.ifBlank { "مصنع مياهنا" },
+                topLeft = Offset(plantPt.x - 30f, plantPt.y + factoryImg.height / 2f + 2f),
+                style = TextStyle(color = Color(0xFF7DD3FC), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            )
+
+            // Custom Tanker Truck Icons at Truck Locations
             resolvedTrucks.forEach { t ->
                 val tp = toScreen(t.lastLat, t.lastLng) ?: return@forEach
-                val markerColor = when (t.status) {
-                    TruckStatus.ON_TRIP -> Color(0xFF0EA5E9)
-                    TruckStatus.LOADING -> Color(0xFFF59E0B)
-                    TruckStatus.IDLE -> Color(0xFF10B981)
-                    TruckStatus.MAINTENANCE -> Color(0xFFF43F5E)
-                }
                 val isSelected = selectedTruckId != null && t.id == selectedTruckId
-                drawCircle(
-                    color = markerColor.copy(alpha = if (isSelected) 0.38f else 0.22f),
-                    radius = if (isSelected) 24f else 17f,
-                    center = tp
-                )
-                if (isSelected) {
-                    drawCircle(color = Color.White, radius = 15f, center = tp, style = Stroke(width = 2.5f))
-                }
-                drawCircle(markerColor, radius = if (isSelected) 11f else 9f, center = tp)
-                drawCircle(Color.White, radius = 3.5f, center = tp)
+                val truckImg = MapMarkerIcons.tankerTruckBitmap(context, t.status, isSelected).asImageBitmap()
+                drawCenteredBitmap(truckImg, tp)
 
                 val badgeLabel = if (t.lastSpeed.isFinite() && t.lastSpeed >= 1.0) {
                     "${t.code} (${t.lastSpeed.safeRoundToInt()} كم/س)"
@@ -573,7 +681,7 @@ private fun OfflineVectorMaribMap(
                 }
                 drawBoundedLabel(
                     text = badgeLabel,
-                    topLeft = Offset(tp.x + 12f, tp.y - 10f),
+                    topLeft = Offset(tp.x + truckImg.width / 2f + 4f, tp.y - 10f),
                     style = TextStyle(
                         color = if (isSelected) Color.White else Color(0xFFE2E8F0),
                         fontSize = if (isSelected) 11.sp else 10.sp,
@@ -584,9 +692,7 @@ private fun OfflineVectorMaribMap(
 
             pickedPoint?.let { (plat, plng) ->
                 val pp = toScreen(plat, plng) ?: return@let
-                drawCircle(Color(0xFFFB7185).copy(alpha = 0.25f), radius = 20f, center = pp)
-                drawCircle(Color(0xFFE11D48), radius = 9f, center = pp)
-                drawCircle(Color.White, radius = 3.5f, center = pp)
+                drawCenteredBitmap(pickedImg, pp)
             }
         }
 
@@ -603,7 +709,7 @@ private fun OfflineVectorMaribMap(
             ) {
                 Column {
                     IconButton(
-                        onClick = { zoom = (zoom * 1.25f).coerceAtMost(4.5f) },
+                        onClick = { zoom = (zoom * 1.25f).coerceAtMost(6.0f) },
                         modifier = Modifier.size(48.dp)
                     ) {
                         Icon(Icons.Default.Add, contentDescription = "تكبير الخريطة", tint = Color.White)
@@ -621,7 +727,55 @@ private fun OfflineVectorMaribMap(
                         },
                         modifier = Modifier.size(48.dp)
                     ) {
-                        Icon(Icons.Default.MyLocation, contentDescription = "إعادة التمركز للمصنع", tint = Color(0xFF38BDF8))
+                        Icon(
+                            Icons.Default.CenterFocusStrong,
+                            contentDescription = stringResource(R.string.map_fit_all),
+                            tint = Color(0xFF10B981)
+                        )
+                    }
+                    if (focusedTruck != null) {
+                        IconButton(
+                            onClick = {
+                                if (canvasSize.width >= 40 && canvasSize.height >= 40) {
+                                    val w = canvasSize.width.toFloat()
+                                    val h = canvasSize.height.toFloat()
+                                    val center = Offset(w / 2f, h / 2f)
+                                    val nx = ((focusedTruck.lastLng - minLng) / (maxLng - minLng)).toFloat() * w
+                                    val ny = ((maxLat - focusedTruck.lastLat) / (maxLat - minLat)).toFloat() * h
+                                    val targetZoom = zoom.coerceIn(1.8f, 4.5f)
+                                    zoom = targetZoom
+                                    panOffset = Offset(-((nx - center.x) * targetZoom), -((ny - center.y) * targetZoom))
+                                }
+                            },
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.LocalShipping,
+                                contentDescription = stringResource(R.string.map_focus_truck),
+                                tint = Color(0xFFF59E0B)
+                            )
+                        }
+                    }
+                    IconButton(
+                        onClick = {
+                            if (canvasSize.width >= 40 && canvasSize.height >= 40) {
+                                val w = canvasSize.width.toFloat()
+                                val h = canvasSize.height.toFloat()
+                                val center = Offset(w / 2f, h / 2f)
+                                val nx = ((safePlantLng - minLng) / (maxLng - minLng)).toFloat() * w
+                                val ny = ((maxLat - safePlantLat) / (maxLat - minLat)).toFloat() * h
+                                val targetZoom = zoom.coerceIn(1.5f, 4.0f)
+                                zoom = targetZoom
+                                panOffset = Offset(-((nx - center.x) * targetZoom), -((ny - center.y) * targetZoom))
+                            }
+                        },
+                        modifier = Modifier.size(48.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Factory,
+                            contentDescription = stringResource(R.string.map_focus_plant),
+                            tint = Color(0xFF38BDF8)
+                        )
                     }
                 }
             }
@@ -649,9 +803,9 @@ fun LocationPickerDialog(
     onConfirm: (Double, Double) -> Unit
 ) {
     val safeInitialLat = if (isValidLatLng(initialLat, initialLng)) initialLat
-    else if (isValidLatLng(plantLocation.lat, plantLocation.lng)) plantLocation.lat else 15.4920
+    else if (isValidLatLng(plantLocation.lat, plantLocation.lng)) plantLocation.lat else 15.4698538
     val safeInitialLng = if (isValidLatLng(initialLat, initialLng)) initialLng
-    else if (isValidLatLng(plantLocation.lat, plantLocation.lng)) plantLocation.lng else 45.3620
+    else if (isValidLatLng(plantLocation.lat, plantLocation.lng)) plantLocation.lng else 45.3636985
     var selectedLatLng by remember(safeInitialLat, safeInitialLng) {
         mutableStateOf(safeInitialLat to safeInitialLng)
     }
@@ -679,7 +833,7 @@ fun LocationPickerDialog(
                     }
                 }
                 Text(
-                    text = "اضغط على أي نقطة داخل خريطة مأرب/الوادي لتحديد الإحداثيات:",
+                    text = "اضغط على أي نقطة داخل الخريطة لتحديد الإحداثيات:",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

@@ -35,13 +35,20 @@
     <string name="cloud_connected">السحابة متصلة</string>
     <string name="cloud_signout">فصل السحابة</string>
 
-    <!-- Google Maps & Database -->
+    <!-- OpenStreetMap & Database -->
+    <string name="map_mode_osm">خريطة حقيقية</string>
     <string name="map_mode_google">خرائط Google</string>
     <string name="map_mode_vector">خريطة محلية</string>
+    <string name="map_style_streets">شوارع OSM</string>
+    <string name="map_style_satellite">قمر صناعي</string>
+    <string name="map_style_topo">تضاريس</string>
     <string name="map_type_normal">عادي</string>
     <string name="map_type_satellite">قمر صناعي</string>
     <string name="map_type_hybrid">هجين</string>
-    <string name="maps_key_missing_hint">لتفعيل خرائط Google الحية أضف MAPS_API_KEY في لوحة الأسرار (Secrets) — تعمل الخريطة المحلية حالياً بدون انقطاع.</string>
+    <string name="map_fit_all">عرض الكل</string>
+    <string name="map_focus_truck">موقع الوايت</string>
+    <string name="map_focus_plant">موقع المصنع</string>
+    <string name="maps_key_missing_hint">تعمل الخريطة الحقيقية مفتوحة المصدر (OpenStreetMap) تلقائياً بدون الحاجة لمفتاح API.</string>
 
     <!-- Manager Navigation Tabs -->
     <string name="tab_overview">نظرة عامة</string>
@@ -60,7 +67,7 @@
     <!-- Driver Navigation Tabs -->
     <string name="driver_tab_trip">الرحلة الحالية</string>
     <string name="driver_tab_gps">الوقود والتسليم</string>
-    <string name="driver_tab_field_order">طلب/عميل ميداني</string>
+    <string name="driver_tab_field_order">الطلبات</string>
     <string name="driver_tab_sync">المزامنة</string>
 
     <!-- Permissions & Operational Services -->
@@ -71,6 +78,11 @@
     <string name="notification_channel_tracking_desc">تشغيل خدمة الموقع لتنسيق رحلات التوصيل واستقبال التنبيهات</string>
     <string name="tracking_notification_title">مياهنا — خدمة التوصيل نشطة</string>
     <string name="tracking_notification_text">خدمة الموقع والتنبيهات الفورية تعمل لرحلات التوصيل</string>
+    <string name="gps_disabled_notification_title">تنبيه: تم إيقاف GPS في الجهاز</string>
+    <string name="gps_disabled_notification_text">تشغيل GPS إلزامي لتسجيل مسار الرحلة — اضغط لتفعيله الآن</string>
+    <string name="driver_gps_gate_title">تشغيل GPS إلزامي في جوال السائق</string>
+    <string name="driver_gps_gate_subtitle">لتتمكن من قبول الرحلات وإرسال الطلبات وتسجيل مسار الرحلة في الخلفية (حتى عند انقطاع الإنترنت أو الخروج من التطبيق)، يجب منح صلاحية الموقع وتفعيل GPS في الجهاز دائماً.</string>
+    <string name="enable_device_gps_button">تفعيل GPS الجهاز الآن</string>
     <string name="notification_channel_alerts_name">إشعارات وتوجيهات مياهنا</string>
     <string name="notification_channel_alerts_desc">تنبيهات فورية للرحلات والطلبات والتوجيهات الإدارية حتى عند إغلاق التطبيق</string>
     <string name="notification_permission_title">تفعيل الإشعارات الفورية</string>

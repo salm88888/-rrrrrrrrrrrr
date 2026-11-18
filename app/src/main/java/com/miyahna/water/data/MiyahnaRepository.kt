@@ -13,6 +13,7 @@ import com.miyahna.water.data.cloud.CloudUserInfo
 import com.miyahna.water.data.cloud.FirebaseSyncManager
 import com.miyahna.water.data.cloud.toFriendlyFirestoreMessage
 import com.miyahna.water.data.local.AppStateSnapshotEntity
+import com.miyahna.water.data.local.AuthSessionPrefs
 import com.miyahna.water.data.local.CustomerDao
 import com.miyahna.water.data.local.DeliveryLocationDao
 import com.miyahna.water.data.local.MiyahnaStateDao
@@ -22,6 +23,7 @@ import com.miyahna.water.data.local.TripStateTransitionDao
 import com.miyahna.water.data.local.toDomain
 import com.miyahna.water.data.local.toEntity
 import com.miyahna.water.data.location.DeliveryLocationCaptureService
+import com.miyahna.water.data.location.DeviceLocationHelper
 import com.miyahna.water.data.location.LocationTrackingPrefs
 import com.miyahna.water.data.location.LocationTrackingService
 import com.miyahna.water.data.notifications.MiyahnaNotificationHelper
@@ -43,6 +45,7 @@ import com.miyahna.water.domain.Expense
 import com.miyahna.water.domain.ExpenseCategory
 import com.miyahna.water.domain.GPSEvent
 import com.miyahna.water.domain.GPSEventType
+import com.miyahna.water.domain.GPSGap
 import com.miyahna.water.domain.GeoLocationPoint
 import com.miyahna.water.domain.GpsTrackingEngine
 import com.miyahna.water.domain.Invoice
@@ -95,6 +98,7 @@ data class MiyahnaDomainState(
     val isLoaded: Boolean = false,
     val isOnline: Boolean = true,
     val savedRole: AppRole? = null,
+    val isManagerUnlocked: Boolean = false,
     val driverSession: DriverSession? = null,
     val settings: SystemSettings = SystemSettings(),
     val truck: Truck = Truck(),
@@ -153,6 +157,9 @@ class MiyahnaRepository(
     private val _isGpsPowerSaveActive = MutableStateFlow(false)
     val isGpsPowerSaveActive: StateFlow<Boolean> = _isGpsPowerSaveActive.asStateFlow()
 
+    private val _isDeviceGpsEnabled = MutableStateFlow(DeviceLocationHelper.isDeviceGpsEnabled(context))
+    val isDeviceGpsEnabled: StateFlow<Boolean> = _isDeviceGpsEnabled.asStateFlow()
+
     private val _deliveryCaptureMessages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val deliveryCaptureMessages: SharedFlow<String> = _deliveryCaptureMessages.asSharedFlow()
 
@@ -168,11 +175,22 @@ class MiyahnaRepository(
     private val transitionSeq = AtomicLong(0L)
     private val idSeq = AtomicLong(1000L)
     private val autoPausedTripIds = ConcurrentHashMap.newKeySet<String>()
+    private val pendingDeletedTripIds = ConcurrentHashMap.newKeySet<String>()
+
+    @Volatile
+    private var gpsHardwareDisabledAtMs: Long? = null
+
+    @Volatile
+    private var gpsHardwareDisabledIso: String? = null
+
+    @Volatile
+    private var gpsHardwareDisabledLatLng: Pair<Double, Double>? = null
 
     private fun nextId(prefix: String): String = "$prefix-${System.currentTimeMillis()}-${idSeq.incrementAndGet()}"
 
     private val notificationHelper = MiyahnaNotificationHelper(context)
 
+    private var realtimeSettingsJob: Job? = null
     private var realtimeTrucksJob: Job? = null
     private var realtimeTripsJob: Job? = null
     private var realtimeCustomersJob: Job? = null
@@ -210,6 +228,124 @@ class MiyahnaRepository(
 
     fun setGpsPowerSaveActive(active: Boolean) {
         _isGpsPowerSaveActive.value = active
+    }
+
+    fun setDeviceGpsEnabled(enabled: Boolean) {
+        val previous = _isDeviceGpsEnabled.getAndSetIfChanged(enabled)
+        if (previous == enabled) return
+
+        val snap = _state.value
+        val activeTrip = snap.trips.firstOrNull {
+            it.status == TripStatus.IN_PROGRESS || it.status == TripStatus.PAUSED
+        } ?: return
+
+        val now = nowIso()
+        val nowMs = System.currentTimeMillis()
+        val lastPt = activeTrip.gpsPoints.lastOrNull()
+        val lastLat = lastPt?.lat ?: snap.truck.lastLat.takeIf { it != 0.0 }
+        val lastLng = lastPt?.lng ?: snap.truck.lastLng.takeIf { it != 0.0 }
+
+        if (!enabled) {
+            gpsHardwareDisabledAtMs = nowMs
+            gpsHardwareDisabledIso = now
+            gpsHardwareDisabledLatLng = if (lastLat != null && lastLng != null) lastLat to lastLng else null
+            val offEvent = if (lastLat != null && lastLng != null) {
+                GPSEvent(
+                    id = nextId("ev-gpsoff"),
+                    tripId = activeTrip.id,
+                    tripNumber = activeTrip.tripNumber,
+                    timestamp = now,
+                    eventType = GPSEventType.STOPPED,
+                    lat = lastLat,
+                    lng = lastLng,
+                    speed = 0.0,
+                    customerName = "تم إيقاف GPS من هاتف السائق",
+                    source = "device_gps_off",
+                    sequenceNumber = snap.gpsEvents.size + 1
+                )
+            } else null
+            val offGap = GPSGap(
+                id = "gap-hw-${activeTrip.id}-$nowMs",
+                tripId = activeTrip.id,
+                startTime = now,
+                endTime = now,
+                durationSeconds = 0,
+                reason = "gps_hardware_disabled",
+                fromLat = lastLat,
+                fromLng = lastLng,
+                toLat = lastLat,
+                toLng = lastLng
+            )
+            scope.launch {
+                mutateState(syncToCloudAfter = snap.isOnline) { s ->
+                    s.copy(
+                        trips = s.trips.map { t ->
+                            if (t.id == activeTrip.id) {
+                                t.copy(
+                                    gpsGaps = t.gpsGaps + offGap,
+                                    auditLogs = t.auditLogs + TripAuditEntry(
+                                        id = nextId("aud"),
+                                        timestamp = now,
+                                        actorRole = "driver",
+                                        actorName = snap.driverSession?.name ?: t.driverName,
+                                        action = "إيقاف GPS",
+                                        details = "تم إيقاف خدمة الموقع (GPS) على جهاز السائق"
+                                    )
+                                )
+                            } else t
+                        },
+                        gpsEvents = if (offEvent != null) (s.gpsEvents + offEvent).takeLast(150) else s.gpsEvents
+                    )
+                }
+            }
+        } else {
+            val disabledMs = gpsHardwareDisabledAtMs
+            val disabledIso = gpsHardwareDisabledIso
+            val disabledCoord = gpsHardwareDisabledLatLng
+            gpsHardwareDisabledAtMs = null
+            gpsHardwareDisabledIso = null
+            gpsHardwareDisabledLatLng = null
+            if (disabledMs != null && disabledIso != null) {
+                val durSec = ((nowMs - disabledMs) / 1000L).toInt().coerceAtLeast(1)
+                scope.launch {
+                    mutateState(syncToCloudAfter = snap.isOnline) { s ->
+                        s.copy(
+                            trips = s.trips.map { t ->
+                                if (t.id == activeTrip.id) {
+                                    val updatedGaps = t.gpsGaps.map { g ->
+                                        if (g.reason == "gps_hardware_disabled" && g.startTime == disabledIso) {
+                                            g.copy(
+                                                endTime = now,
+                                                durationSeconds = durSec,
+                                                toLat = lastLat ?: disabledCoord?.first,
+                                                toLng = lastLng ?: disabledCoord?.second
+                                            )
+                                        } else g
+                                    }
+                                    t.copy(
+                                        gpsGaps = updatedGaps,
+                                        auditLogs = t.auditLogs + TripAuditEntry(
+                                            id = nextId("aud"),
+                                            timestamp = now,
+                                            actorRole = "driver",
+                                            actorName = snap.driverSession?.name ?: t.driverName,
+                                            action = "تشغيل GPS",
+                                            details = "عودة خدمة الموقع (GPS) بعد توقف $durSec ثانية"
+                                        )
+                                    )
+                                } else t
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun MutableStateFlow<Boolean>.getAndSetIfChanged(next: Boolean): Boolean {
+        val prev = value
+        if (prev != next) value = next
+        return prev
     }
 
     fun observeUnsyncedGpsPointsCount(): Flow<Int> =
@@ -327,10 +463,15 @@ class MiyahnaRepository(
         }
     }
 
+    private fun syncFleetMemberEmails(accounts: List<DriverAccount>) {
+        cloudSync.setFleetMemberEmails(accounts.mapNotNull { it.googleEmail })
+    }
+
     private fun startCloudRealtimeListeners() {
         val current = _state.value
         if (current.cloudUser == null || !current.isOnline) return
-        if (realtimeTrucksJob?.isActive == true &&
+        if (realtimeSettingsJob?.isActive == true &&
+            realtimeTrucksJob?.isActive == true &&
             realtimeTripsJob?.isActive == true &&
             realtimeCustomersJob?.isActive == true &&
             realtimeOrdersJob?.isActive == true &&
@@ -343,6 +484,20 @@ class MiyahnaRepository(
 
         stopCloudRealtimeListeners()
         _state.update { it.copy(isRealtimeFleetConnected = true) }
+
+        realtimeSettingsJob = scope.launch {
+            runCatching {
+                cloudSync.observeRealTimeSettings().collect { cloudSettings ->
+                    if (cloudSettings == null) return@collect
+                    val normalized = migrateLegacyPlantSettings(cloudSettings)
+                    mutateState(syncToCloudAfter = false) { s ->
+                        if (s.settings == normalized) s
+                        else s.copy(settings = normalized, isRealtimeFleetConnected = true)
+                    }
+                    runCatching { LocationTrackingService.updatePowerSaveConfig(context, normalized) }
+                }
+            }
+        }
 
         realtimeTrucksJob = scope.launch {
             runCatching {
@@ -375,9 +530,12 @@ class MiyahnaRepository(
                 cloudSync.observeRealTimeTrips().collect { cloudTrips ->
                     if (cloudTrips.isEmpty()) return@collect
                     mutateState(syncToCloudAfter = false) { s ->
+                        val filteredCloud = cloudTrips.filterNot { it.id in pendingDeletedTripIds }
                         val localById = s.trips.associateBy { it.id }
-                        val cloudById = cloudTrips.associateBy { it.id }
-                        val allIds = (s.trips.map { it.id } + cloudTrips.map { it.id }).distinct()
+                        val cloudById = filteredCloud.associateBy { it.id }
+                        val allIds = (s.trips.map { it.id } + filteredCloud.map { it.id })
+                            .distinct()
+                            .filterNot { it in pendingDeletedTripIds }
                         val mergedTrips = allIds.mapNotNull { id ->
                             mergeTrip(localById[id], cloudById[id], s.settings)
                         }
@@ -401,7 +559,7 @@ class MiyahnaRepository(
                     if (cloudCustomers.isEmpty()) return@collect
                     mutateState(syncToCloudAfter = false) { s ->
                         val offlineLocal = s.customers.filter { it.isOfflineCreated }
-                        val merged = (cloudCustomers + offlineLocal).distinctBy { it.id }
+                        val merged = (offlineLocal + cloudCustomers).distinctBy { it.id }
                         s.copy(customers = merged, isRealtimeFleetConnected = true)
                     }
                 }
@@ -426,7 +584,7 @@ class MiyahnaRepository(
                 cloudSync.observeRealTimeNotifications().collect { cloudNotifs ->
                     if (cloudNotifs.isEmpty()) return@collect
                     mutateState(syncToCloudAfter = false) { s ->
-                        val merged = (cloudNotifs + s.notifications).distinctBy { it.id }.take(250)
+                        val merged = mergeNotifications(s.notifications, cloudNotifs)
                         s.copy(notifications = merged)
                     }
                 }
@@ -465,9 +623,9 @@ class MiyahnaRepository(
             runCatching {
                 cloudSync.observeRealTimeDriverAccounts().collect { cloudDrivers ->
                     if (cloudDrivers.isEmpty()) return@collect
+                    syncFleetMemberEmails(cloudDrivers + _state.value.driverAccounts)
                     mutateState(syncToCloudAfter = false) { s ->
-                        val cloudById = cloudDrivers.associateBy { it.id }
-                        val merged = (cloudDrivers + s.driverAccounts.filterNot { it.id in cloudById }).distinctBy { it.id }
+                        val merged = mergeDriverAccounts(s.driverAccounts, cloudDrivers)
                         s.copy(driverAccounts = merged, isRealtimeFleetConnected = true)
                     }
                 }
@@ -493,6 +651,8 @@ class MiyahnaRepository(
     }
 
     private fun stopCloudRealtimeListeners() {
+        realtimeSettingsJob?.cancel()
+        realtimeSettingsJob = null
         realtimeTrucksJob?.cancel()
         realtimeTrucksJob = null
         realtimeTripsJob?.cancel()
@@ -514,6 +674,39 @@ class MiyahnaRepository(
         _state.update { it.copy(isRealtimeFleetConnected = false) }
     }
 
+    private fun mergeNotifications(
+        localList: List<AppNotification>,
+        cloudList: List<AppNotification>
+    ): List<AppNotification> {
+        val merged = linkedMapOf<String, AppNotification>()
+        (localList + cloudList).forEach { item ->
+            val prev = merged[item.id]
+            merged[item.id] = if (prev == null) item else item.copy(isRead = prev.isRead || item.isRead)
+        }
+        return merged.values.sortedByDescending { it.createdAt }.take(250)
+    }
+
+    private fun mergeDriverAccounts(
+        localList: List<DriverAccount>,
+        cloudList: List<DriverAccount>
+    ): List<DriverAccount> {
+        val localById = localList.associateBy { it.id }
+        val cloudById = cloudList.associateBy { it.id }
+        val allIds = (cloudList.map { it.id } + localList.map { it.id }).distinct()
+        return allIds.mapNotNull { id ->
+            val local = localById[id]
+            val cloud = cloudById[id]
+            when {
+                local == null -> cloud
+                cloud == null -> local
+                else -> cloud.copy(
+                    googleEmail = cloud.googleEmail ?: local.googleEmail,
+                    lastLoginAt = listOfNotNull(cloud.lastLoginAt, local.lastLoginAt).maxOrNull()
+                )
+            }
+        }
+    }
+
     private fun syncPrimaryTruckIntoFleet(primary: Truck, fleet: List<Truck>): List<Truck> {
         val withoutPrimary = fleet.filterNot { it.id == primary.id }
         return listOf(primary) + withoutPrimary
@@ -533,7 +726,20 @@ class MiyahnaRepository(
             when {
                 local == null -> cloud
                 cloud == null -> local
-                id == preferLocalPrimaryId -> local
+                id == preferLocalPrimaryId -> {
+                    val useLocalTelemetry = local.lastUpdateTimestamp >= cloud.lastUpdateTimestamp
+                    cloud.copy(
+                        status = if (useLocalTelemetry) local.status else cloud.status,
+                        currentTripId = if (useLocalTelemetry) local.currentTripId else cloud.currentTripId,
+                        currentWaterLiters = if (useLocalTelemetry) local.currentWaterLiters else cloud.currentWaterLiters,
+                        lastLat = if (useLocalTelemetry) local.lastLat else cloud.lastLat,
+                        lastLng = if (useLocalTelemetry) local.lastLng else cloud.lastLng,
+                        lastSpeed = if (useLocalTelemetry) local.lastSpeed else cloud.lastSpeed,
+                        lastUpdateTimestamp = if (useLocalTelemetry) local.lastUpdateTimestamp else cloud.lastUpdateTimestamp,
+                        lastEvent = if (useLocalTelemetry) local.lastEvent else cloud.lastEvent,
+                        odometerKm = max(local.odometerKm, cloud.odometerKm)
+                    )
+                }
                 cloud.lastUpdateTimestamp >= local.lastUpdateTimestamp -> cloud
                 else -> local
             }
@@ -543,7 +749,11 @@ class MiyahnaRepository(
     private suspend fun loadInitialState() {
         mutex.withLock {
             val snap = stateDao.getSnapshot()
-            val pendingCount = stateDao.getPendingOps().size
+            val pendingOps = stateDao.getPendingOps()
+            pendingOps.filter { it.type == "trip_delete" }.forEach { op ->
+                if (op.payloadJson.isNotBlank()) pendingDeletedTripIds.add(op.payloadJson)
+            }
+            val pendingCount = pendingOps.size
             val user = cloudSync.currentCloudUser()
             if (snap != null) {
                 val snapCustomers = runCatching { json.decodeFromString<List<Customer>>(snap.customersJson) }.getOrDefault(emptyList())
@@ -556,10 +766,17 @@ class MiyahnaRepository(
                     }
                     snapCustomers
                 }
-                val restoredSettings = runCatching { json.decodeFromString<SystemSettings>(snap.settingsJson) }.getOrDefault(SystemSettings())
+                val rawRestoredSettings = runCatching { json.decodeFromString<SystemSettings>(snap.settingsJson) }.getOrDefault(SystemSettings())
+                val restoredSettings = migrateLegacyPlantSettings(rawRestoredSettings)
                 val rawTrips = runCatching { json.decodeFromString<List<Trip>>(snap.tripsJson) }.getOrDefault(emptyList())
+                val unsyncedTripIds = tripGpsPointDao.getUnsyncedPointsOnce().map { it.tripId }.toSet()
                 val restoredTrips = rawTrips.map { trip ->
-                    if (trip.status == TripStatus.IN_PROGRESS || trip.status == TripStatus.PAUSED || trip.status == TripStatus.PENDING_SYNC || trip.syncStatus == TripSyncStatus.PENDING_SYNC) {
+                    val shouldHydrate = trip.status == TripStatus.IN_PROGRESS ||
+                        trip.status == TripStatus.PAUSED ||
+                        trip.status == TripStatus.PENDING_SYNC ||
+                        trip.syncStatus == TripSyncStatus.PENDING_SYNC ||
+                        trip.id in unsyncedTripIds
+                    if (shouldHydrate) {
                         val roomPts = tripGpsPointDao.getPointsForTripOnce(trip.id).map { it.toDomain() }
                         val mergedPts = (trip.gpsPoints + roomPts).distinctBy { it.id }
                         if (mergedPts.size > trip.gpsPoints.size) {
@@ -581,16 +798,52 @@ class MiyahnaRepository(
                     } else trip
                 }
 
-                val restoredTruck = runCatching { json.decodeFromString<Truck>(snap.truckJson) }.getOrDefault(Truck())
+                val rawRestoredTruck = runCatching { json.decodeFromString<Truck>(snap.truckJson) }.getOrDefault(Truck())
+                val restoredTruck = if (
+                    kotlin.math.abs(rawRestoredTruck.lastLat - 15.4920) < 0.0001 &&
+                    kotlin.math.abs(rawRestoredTruck.lastLng - 45.3620) < 0.0001 &&
+                    rawRestoredTruck.currentTripId == null
+                ) {
+                    rawRestoredTruck.copy(lastLat = 15.4698538, lastLng = 45.3636985)
+                } else {
+                    rawRestoredTruck
+                }
                 val rawFleetTrucks = runCatching { json.decodeFromString<List<Truck>>(snap.fleetTrucksJson) }.getOrDefault(emptyList())
                 val restoredFleetTrucks = syncPrimaryTruckIntoFleet(restoredTruck, rawFleetTrucks)
                 val restoredTransitions = tripStateTransitionDao.getAllTransitionsOnce().map { it.toDomain() }
 
+                val prefsSavedRole = AuthSessionPrefs.getSavedRole(context)
+                val prefsDriverSession = AuthSessionPrefs.getDriverSession(context)
+                val snapRole = snap.savedRole?.let { r -> AppRole.entries.firstOrNull { it.wire == r } }
+                val resolvedRole = if (AuthSessionPrefs.hasExplicitRole(context)) {
+                    prefsSavedRole
+                } else {
+                    snapRole ?: prefsSavedRole
+                }
+                val snapDriverSession = snap.driverSessionJson
+                    ?.let { runCatching { json.decodeFromString<DriverSession>(it) }.getOrNull() }
+                val resolvedDriverSession = if (AuthSessionPrefs.hasExplicitDriverSession(context)) {
+                    prefsDriverSession
+                } else {
+                    snapDriverSession ?: prefsDriverSession
+                }
+                val unlockedManager = AuthSessionPrefs.isManagerUnlocked(context) || resolvedRole == AppRole.MANAGER
+                if (!AuthSessionPrefs.hasExplicitRole(context) && resolvedRole != null) {
+                    AuthSessionPrefs.setSavedRole(context, resolvedRole)
+                }
+                if (!AuthSessionPrefs.hasExplicitDriverSession(context) && resolvedDriverSession != null) {
+                    AuthSessionPrefs.setDriverSession(context, resolvedDriverSession)
+                }
+                if (unlockedManager) {
+                    AuthSessionPrefs.setManagerUnlocked(context, true)
+                }
+
                 val restored = MiyahnaDomainState(
                     isLoaded = true,
                     isOnline = _state.value.isOnline,
-                    savedRole = snap.savedRole?.let { r -> AppRole.entries.firstOrNull { it.wire == r } },
-                    driverSession = snap.driverSessionJson?.let { runCatching { json.decodeFromString<DriverSession>(it) }.getOrNull() },
+                    savedRole = resolvedRole,
+                    isManagerUnlocked = unlockedManager,
+                    driverSession = resolvedDriverSession,
                     settings = restoredSettings,
                     truck = restoredTruck,
                     fleetTrucks = restoredFleetTrucks,
@@ -612,9 +865,15 @@ class MiyahnaRepository(
             } else {
                 val defaultTruck = Truck(lastUpdateTimestamp = nowIso())
                 val restoredTransitions = tripStateTransitionDao.getAllTransitionsOnce().map { it.toDomain() }
+                val prefsSavedRole = AuthSessionPrefs.getSavedRole(context)
+                val prefsDriverSession = AuthSessionPrefs.getDriverSession(context)
+                val unlockedManager = AuthSessionPrefs.isManagerUnlocked(context) || prefsSavedRole == AppRole.MANAGER
                 val initial = MiyahnaDomainState(
                     isLoaded = true,
                     isOnline = _state.value.isOnline,
+                    savedRole = prefsSavedRole,
+                    isManagerUnlocked = unlockedManager,
+                    driverSession = prefsDriverSession,
                     truck = defaultTruck,
                     fleetTrucks = listOf(defaultTruck),
                     tripStateTransitions = restoredTransitions,
@@ -626,6 +885,7 @@ class MiyahnaRepository(
             }
         }
         val current = _state.value
+        syncFleetMemberEmails(current.driverAccounts)
         notificationHelper.markNotificationsSeen(current.notifications.filter { it.isRead }.map { it.id })
         notificationHelper.notifyNewUnreadNotifications(current)
         val hasPendingSyncWork = current.pendingSyncCount > 0 ||
@@ -706,12 +966,18 @@ class MiyahnaRepository(
         val hasPendingTrip = snapshotToSync.trips.any {
             it.syncStatus == TripSyncStatus.PENDING_SYNC || it.status == TripStatus.PENDING_SYNC
         }
-        if ((enqueuedOffline || (hasPendingTrip && !snapshotToSync.isOnline))) {
+        val onlineNow = checkNetworkOnlineNow() && snapshotToSync.isOnline
+        if (enqueuedOffline || !onlineNow || hasPendingTrip) {
             runCatching { TripSyncWorker.enqueueWhenOnline(context) }
         }
         notificationHelper.notifyNewUnreadNotifications(snapshotToSync)
-        if (syncToCloudAfter && snapshotToSync.isOnline && snapshotToSync.cloudUser != null) {
-            scope.launch { pushCloudSnapshotInternal(snapshotToSync) }
+        if (syncToCloudAfter && onlineNow && snapshotToSync.cloudUser != null) {
+            scope.launch {
+                val res = pushCloudSnapshotInternal(snapshotToSync)
+                if (res.isFailure) {
+                    runCatching { TripSyncWorker.enqueueWhenOnline(context) }
+                }
+            }
         }
     }
 
@@ -733,19 +999,47 @@ class MiyahnaRepository(
 
     fun verifyManagerPin(pin: String): Boolean {
         val expected = _state.value.settings.managerPin.ifBlank { "20262027" }
-        return pin.trim() == expected
+        val ok = pin.trim() == expected
+        if (ok) {
+            AuthSessionPrefs.setManagerUnlocked(context, true)
+            AuthSessionPrefs.setSavedRole(context, AppRole.MANAGER)
+            _state.update { it.copy(isManagerUnlocked = true, savedRole = AppRole.MANAGER) }
+        }
+        return ok
     }
 
     suspend fun selectRole(role: AppRole?) {
+        AuthSessionPrefs.setSavedRole(context, role)
+        if (role == AppRole.MANAGER) {
+            AuthSessionPrefs.setManagerUnlocked(context, true)
+        }
         if (role != AppRole.DRIVER) {
             LocationTrackingPrefs.clear(context)
         }
-        mutateState(syncToCloudAfter = false) { it.copy(savedRole = role) }
+        _state.update {
+            it.copy(
+                savedRole = role,
+                isManagerUnlocked = if (role == AppRole.MANAGER) true else it.isManagerUnlocked
+            )
+        }
+        mutateState(syncToCloudAfter = false) {
+            it.copy(
+                savedRole = role,
+                isManagerUnlocked = if (role == AppRole.MANAGER) true else it.isManagerUnlocked
+            )
+        }
         if (role != AppRole.DRIVER) {
             stopTrackingServiceIfNotDriver()
         } else {
             ensureDriverBackgroundGpsRunning()
         }
+    }
+
+    suspend fun lockManagerSession() {
+        AuthSessionPrefs.setManagerUnlocked(context, false)
+        AuthSessionPrefs.setSavedRole(context, null)
+        _state.update { it.copy(isManagerUnlocked = false, savedRole = null) }
+        mutateState(syncToCloudAfter = false) { it.copy(isManagerUnlocked = false, savedRole = null) }
     }
 
     suspend fun changeManagerPin(currentPin: String, newPin: String): ActionResult<Unit> {
@@ -780,12 +1074,14 @@ class MiyahnaRepository(
             return ActionResult(false, error = "اسم المستخدم أو رقم الهاتف مسجل مسبقاً")
         }
 
+        val linkedGoogleEmail = _state.value.cloudUser?.email?.trim()?.lowercase()?.takeIf { it.contains("@") }
         val acc = DriverAccount(
             id = nextId("drv"),
             name = name.trim(),
             username = cleanUser,
             phone = cleanPhone,
             password = password,
+            googleEmail = linkedGoogleEmail,
             licenseNumber = licenseNumber?.trim()?.takeIf { it.isNotEmpty() },
             status = DriverAccountStatus.PENDING,
             createdAt = nowIso(),
@@ -798,16 +1094,86 @@ class MiyahnaRepository(
             category = "driver_account_requested",
             priority = NotificationPriority.ACTION_REQUIRED,
             title = "طلب انضمام سائق جديد: ${acc.name}",
-            message = "الهاتف: ${acc.phone} — بانتظار اعتماد المدير",
+            message = "الهاتف: ${acc.phone}${linkedGoogleEmail?.let { " · Google: $it" } ?: ""} — بانتظار اعتماد المدير",
             actionTab = "drivers"
         )
         mutateState { s ->
+            val updatedAccounts = listOf(acc) + s.driverAccounts
+            syncFleetMemberEmails(updatedAccounts)
             s.copy(
-                driverAccounts = listOf(acc) + s.driverAccounts,
+                driverAccounts = updatedAccounts,
                 notifications = listOf(notif) + s.notifications
             )
         }
         return ActionResult(true, data = acc)
+    }
+
+    suspend fun createDriverAccountByManager(
+        name: String,
+        username: String,
+        phone: String,
+        password: String,
+        googleEmail: String?,
+        licenseNumber: String?
+    ): ActionResult<DriverAccount> {
+        val cleanName = name.trim()
+        val cleanUser = username.trim()
+        val cleanPhone = phone.trim()
+        val cleanEmail = googleEmail?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        if (cleanName.isBlank() || cleanUser.isBlank() || cleanPhone.isBlank() || password.length < 4) {
+            return ActionResult(false, error = "يرجى إكمال الاسم واسم المستخدم والهاتف وكلمة مرور (4 أحرف+)")
+        }
+        if (cleanEmail != null && !cleanEmail.contains("@")) {
+            return ActionResult(false, error = "صيغة بريد Google غير صحيحة")
+        }
+        val exists = _state.value.driverAccounts.any {
+            it.username.equals(cleanUser, ignoreCase = true) || it.phone == cleanPhone
+        }
+        if (exists) {
+            return ActionResult(false, error = "اسم المستخدم أو رقم الهاتف مسجل مسبقاً")
+        }
+        val now = nowIso()
+        val acc = DriverAccount(
+            id = nextId("drv"),
+            name = cleanName,
+            username = cleanUser,
+            phone = cleanPhone,
+            password = password,
+            googleEmail = cleanEmail,
+            licenseNumber = licenseNumber?.trim()?.takeIf { it.isNotEmpty() },
+            status = DriverAccountStatus.APPROVED,
+            createdAt = now,
+            createdBy = "manager",
+            approvedAt = now,
+            approvedBy = "المدير العام"
+        )
+        mutateState { s ->
+            val updatedAccounts = listOf(acc) + s.driverAccounts
+            syncFleetMemberEmails(updatedAccounts)
+            val updatedTruck = if (s.truck.driverId.isBlank()) {
+                s.truck.copy(driverId = acc.id, driverName = acc.name, driverPhone = acc.phone)
+            } else s.truck
+            s.copy(
+                driverAccounts = updatedAccounts,
+                truck = updatedTruck
+            )
+        }
+        return ActionResult(true, data = acc)
+    }
+
+    suspend fun updateDriverGoogleEmail(driverId: String, email: String): ActionResult<Unit> {
+        val cleanEmail = email.trim().lowercase().takeIf { it.isNotEmpty() }
+        if (cleanEmail != null && !cleanEmail.contains("@")) {
+            return ActionResult(false, error = "يرجى إدخال بريد Google صحيح مثل driver@gmail.com")
+        }
+        mutateState { s ->
+            val updatedAccounts = s.driverAccounts.map {
+                if (it.id == driverId) it.copy(googleEmail = cleanEmail) else it
+            }
+            syncFleetMemberEmails(updatedAccounts)
+            s.copy(driverAccounts = updatedAccounts)
+        }
+        return ActionResult(true)
     }
 
     suspend fun loginDriver(identifier: String, password: String): ActionResult<DriverSession> {
@@ -835,6 +1201,14 @@ class MiyahnaRepository(
             loggedInAt = nowIso(),
             isDemo = acc.isDemo
         )
+        AuthSessionPrefs.setDriverSession(context, session)
+        AuthSessionPrefs.setSavedRole(context, AppRole.DRIVER)
+        _state.update { s ->
+            s.copy(
+                driverSession = session,
+                savedRole = AppRole.DRIVER
+            )
+        }
         mutateState { s ->
             s.copy(
                 driverSession = session,
@@ -853,7 +1227,10 @@ class MiyahnaRepository(
 
     suspend fun logoutDriver() {
         LocationTrackingPrefs.clear(context)
-        mutateState(syncToCloudAfter = false) { it.copy(driverSession = null) }
+        AuthSessionPrefs.setDriverSession(context, null)
+        AuthSessionPrefs.setSavedRole(context, null)
+        _state.update { it.copy(driverSession = null, savedRole = null) }
+        mutateState(syncToCloudAfter = false) { it.copy(driverSession = null, savedRole = null) }
         runCatching { LocationTrackingService.stop(context) }
     }
 
@@ -880,6 +1257,7 @@ class MiyahnaRepository(
                     )
                 } else it
             }
+            syncFleetMemberEmails(updatedAccounts)
             val updatedTruck = if (s.truck.driverId.isBlank() || s.truck.driverId == driverId) {
                 s.truck.copy(driverId = target.id, driverName = target.name, driverPhone = target.phone)
             } else s.truck
@@ -953,6 +1331,25 @@ class MiyahnaRepository(
         )
     }
 
+    suspend fun attemptCloudAutoSignIn(activityContext: Context): ActionResult<CloudUserInfo> {
+        initJob.join()
+        val current = _state.value
+        current.cloudUser?.let { return ActionResult(true, data = it) }
+        if (!current.isOnline) return ActionResult(false, error = "غير متصل بالإنترنت")
+        val res = cloudSync.attemptAutoSignIn(activityContext)
+        return res.fold(
+            onSuccess = { user ->
+                _state.update { it.copy(cloudUser = user, cloudSyncError = null) }
+                syncWithCloud()
+                startCloudRealtimeListeners()
+                ActionResult(true, data = user)
+            },
+            onFailure = { err ->
+                ActionResult(false, error = err.message)
+            }
+        )
+    }
+
     fun signOutCloud() {
         stopCloudRealtimeListeners()
         scope.launch { cloudSync.signOut() }
@@ -963,36 +1360,87 @@ class MiyahnaRepository(
         initJob.join()
         val onlineNow = checkNetworkOnlineNow() || _state.value.isOnline
         if (!onlineNow) return false
-        if (!_state.value.isOnline) {
-            _state.update { it.copy(isOnline = true) }
-        }
 
-        val snap = _state.value
+        val resolvedUser = _state.value.cloudUser ?: cloudSync.currentCloudUser()
+        _state.update { it.copy(isOnline = true, cloudUser = resolvedUser ?: it.cloudUser) }
+
         val pendingOps = stateDao.getPendingOps()
-        val pendingTrips = snap.trips.filter {
+        val unsyncedPointEntities = tripGpsPointDao.getUnsyncedPointsOnce()
+        val unsyncedTransitions = tripStateTransitionDao.getUnsyncedTransitionsOnce().map { it.toDomain() }
+        val snapBefore = _state.value
+        val hasPendingTripsInitial = snapBefore.trips.any {
             it.syncStatus == TripSyncStatus.PENDING_SYNC || it.status == TripStatus.PENDING_SYNC
         }
-        val unsyncedPoints = tripGpsPointDao.getUnsyncedPointsOnce()
-        val unsyncedTransitions = tripStateTransitionDao.getUnsyncedTransitionsOnce().map { it.toDomain() }
-        if (pendingOps.isEmpty() && pendingTrips.isEmpty() && unsyncedPoints.isEmpty() && unsyncedTransitions.isEmpty()) {
+        if (pendingOps.isEmpty() && !hasPendingTripsInitial && unsyncedPointEntities.isEmpty() && unsyncedTransitions.isEmpty()) {
             return true
         }
 
+        // Never drop offline queue items or mark Room GPS points synced before Google/Firebase Cloud Auth is active
+        if (resolvedUser == null) {
+            return false
+        }
+
+        // Hydrate document metadata after process restart so non-admin driver pushes update Manager-owned docs safely
+        if (!cloudSync.hasPopulatedMeta() && !resolvedUser.isAdmin) {
+            val pulled = cloudSync.pullCloudSnapshot()
+            if (pulled.isFailure) {
+                return false
+            }
+            val cloud = pulled.getOrThrow()
+            if (cloud.hasAnyDocs) {
+                mergeCloudIntoLocal(cloud)
+            }
+        }
+
+        val snap = _state.value
+        val unsyncedByTrip = unsyncedPointEntities.groupBy { it.tripId }
         val now = nowIso()
         val nowEpoch = System.currentTimeMillis()
         val syncTransitionLogs = mutableListOf<TripStateTransition>()
-        val updatedTrips = snap.trips.map { t ->
+
+        val updatedTrips = snap.trips.map { trip ->
+            val roomPtsForTrip = if (trip.id in unsyncedByTrip || trip.syncStatus == TripSyncStatus.PENDING_SYNC || trip.status == TripStatus.PENDING_SYNC) {
+                tripGpsPointDao.getPointsForTripOnce(trip.id).map { it.toDomain() }
+            } else emptyList()
+
+            val rehydratedTrip = if (roomPtsForTrip.isNotEmpty()) {
+                val combinedPts = (trip.gpsPoints + roomPtsForTrip).distinctBy { it.id }
+                val analysis = GpsTrackingEngine.analyzeGpsTrack(
+                    tripId = trip.id,
+                    rawPoints = combinedPts,
+                    approvedStops = trip.customerStops,
+                    settings = snap.settings
+                )
+                val safeDist = analysis.totalDistanceKm.takeIf { it.isFinite() } ?: 0.0
+                val safeCons = snap.settings.truckDieselConsumptionPerKm.takeIf { it.isFinite() } ?: 0.0
+                val safeDiesel = snap.settings.dieselPricePerLiter.takeIf { it.isFinite() } ?: 0.0
+                val actualFuel = ((safeDist * safeCons) * 100.0).let { if (it.isFinite()) it.roundToInt() else 0 } / 100.0
+                val fuelCost = (actualFuel * safeDiesel).let { if (it.isFinite()) it.roundToInt().toDouble() else 0.0 }
+                val actualCost = trip.productionCost + fuelCost + trip.driverWageShare + trip.maintenanceShare
+                trip.copy(
+                    gpsPoints = analysis.points,
+                    detectedStops = analysis.detectedStops,
+                    gpsGaps = analysis.gpsGaps,
+                    actualDistanceKm = analysis.totalDistanceKm,
+                    actualFuelLiters = actualFuel,
+                    fuelCost = fuelCost,
+                    actualCost = actualCost,
+                    movingMinutes = analysis.movingMinutes,
+                    stoppedMinutes = analysis.stoppedMinutes
+                )
+            } else trip
+
             when {
-                t.status == TripStatus.PENDING_SYNC -> {
+                rehydratedTrip.status == TripStatus.PENDING_SYNC -> {
                     val seq = transitionSeq.incrementAndGet()
                     syncTransitionLogs.add(
                         TripStateTransition(
                             id = "tlog-$nowEpoch-$seq",
-                            tripId = t.id,
-                            tripNumber = t.tripNumber,
-                            truckId = t.truckId,
-                            driverId = t.driverId,
-                            driverName = t.driverName,
+                            tripId = rehydratedTrip.id,
+                            tripNumber = rehydratedTrip.tripNumber,
+                            truckId = rehydratedTrip.truckId,
+                            driverId = rehydratedTrip.driverId,
+                            driverName = rehydratedTrip.driverName,
                             fromState = TripStatus.PENDING_SYNC.wire,
                             toState = TripStatus.COMPLETED_PENDING_REVIEW.wire,
                             triggerSource = "offline_queue_synced",
@@ -1005,16 +1453,30 @@ class MiyahnaRepository(
                             isSyncedToCloud = false
                         )
                     )
-                    t.copy(
+                    rehydratedTrip.copy(
                         status = TripStatus.COMPLETED_PENDING_REVIEW,
                         syncStatus = TripSyncStatus.SYNCED,
                         lastSyncedAt = now
                     )
                 }
-                t.syncStatus == TripSyncStatus.PENDING_SYNC ->
-                    t.copy(syncStatus = TripSyncStatus.SYNCED, lastSyncedAt = now)
-                else -> t
+                rehydratedTrip.syncStatus == TripSyncStatus.PENDING_SYNC || rehydratedTrip.id in unsyncedByTrip ->
+                    rehydratedTrip.copy(syncStatus = TripSyncStatus.SYNCED, lastSyncedAt = now)
+                else -> rehydratedTrip
             }
+        }
+
+        val latestUnsyncedPt = unsyncedPointEntities.maxByOrNull { it.capturedAtEpochMs }
+        val updatedTruck = if (latestUnsyncedPt != null && latestUnsyncedPt.timestamp > snap.truck.lastUpdateTimestamp) {
+            snap.truck.copy(
+                lastLat = latestUnsyncedPt.lat,
+                lastLng = latestUnsyncedPt.lng,
+                lastSpeed = latestUnsyncedPt.speedKmH,
+                lastUpdateTimestamp = latestUnsyncedPt.timestamp
+            )
+        } else snap.truck
+
+        val pendingTripsCount = snap.trips.count {
+            it.syncStatus == TripSyncStatus.PENDING_SYNC || it.status == TripStatus.PENDING_SYNC
         }
         if (syncTransitionLogs.isNotEmpty()) {
             tripStateTransitionDao.insertTransitions(syncTransitionLogs.map { it.toEntity(isSynced = false) })
@@ -1027,16 +1489,18 @@ class MiyahnaRepository(
             actorRole = "system",
             actorName = "المزامنة التلقائية",
             category = "sync_completed",
-            priority = if (pendingTrips.isNotEmpty()) NotificationPriority.ACTION_REQUIRED else NotificationPriority.INFO,
+            priority = if (pendingTripsCount > 0) NotificationPriority.ACTION_REQUIRED else NotificationPriority.INFO,
             title = "تمت مزامنة مسار الرحلة وإرسالها للمدير",
-            message = "تمت مزامنة ${pendingTrips.size} رحلة و${unsyncedPoints.size} نقطة GPS و${allTransitionsToPush.size} تحول حالة.",
-            tripId = pendingTrips.firstOrNull()?.id,
-            tripNumber = pendingTrips.firstOrNull()?.tripNumber,
+            message = "تمت مزامنة $pendingTripsCount رحلة و${unsyncedPointEntities.size} نقطة GPS و${allTransitionsToPush.size} تحول حالة.",
+            tripId = updatedTrips.firstOrNull { it.id in unsyncedByTrip }?.id,
+            tripNumber = updatedTrips.firstOrNull { it.id in unsyncedByTrip }?.tripNumber,
             actionTab = "trips"
         )
         val mergedTransitions = mergeTransitions(allTransitionsToPush, snap.tripStateTransitions).take(500)
         val prepared = snap.copy(
             isOnline = true,
+            cloudUser = resolvedUser,
+            truck = updatedTruck,
             trips = updatedTrips,
             customers = updatedCustomers,
             tripStateTransitions = mergedTransitions,
@@ -1044,31 +1508,46 @@ class MiyahnaRepository(
             pendingSyncCount = 0
         )
 
-        if (snap.cloudUser != null) {
-            val pushed = pushCloudSnapshotInternal(prepared)
-            if (pushed.isFailure) {
-                return false
+        val pendingTripDeletes = pendingOps.filter { it.type == "trip_delete" && it.payloadJson.isNotBlank() }
+        if (pendingTripDeletes.isNotEmpty()) {
+            pendingTripDeletes.forEach { op ->
+                val delRes = cloudSync.deleteTripDocument(op.payloadJson)
+                if (delRes.isFailure) return false
             }
-            if (allTransitionsToPush.isNotEmpty()) {
-                val syncedRes = cloudSync.syncPendingTripStateLogs(allTransitionsToPush)
-                if (syncedRes.isFailure) {
-                    return false
-                }
+            pendingTripDeletes.forEach { op ->
+                pendingDeletedTripIds.remove(op.payloadJson)
             }
         }
 
-        val syncedIds = allTransitionsToPush.map { it.id }.toSet()
+        val pushed = pushCloudSnapshotInternal(prepared)
+        if (pushed.isFailure) {
+            return false
+        }
+        if (allTransitionsToPush.isNotEmpty()) {
+            val syncedRes = cloudSync.syncPendingTripStateLogs(allTransitionsToPush)
+            if (syncedRes.isFailure) {
+                return false
+            }
+        }
+
+        val syncedTransitionIds = allTransitionsToPush.map { it.id }.toSet()
         val finalTransitions = mergedTransitions.map {
-            if (it.id in syncedIds && snap.cloudUser != null) it.copy(isSyncedToCloud = true) else it
+            if (it.id in syncedTransitionIds) it.copy(isSyncedToCloud = true) else it
         }
         val finalPrepared = prepared.copy(tripStateTransitions = finalTransitions)
+        val flushedOpIds = pendingOps.map { it.id }
+        val flushedPointIds = unsyncedPointEntities.map { it.id }
 
         mutex.withLock {
             _state.value = finalPrepared
             persistStateLocked(finalPrepared)
-            stateDao.clearAllPendingOps()
-            tripGpsPointDao.markAllPointsSynced()
-            if (snap.cloudUser != null) {
+            flushedOpIds.chunked(400).forEach { chunk ->
+                stateDao.deletePendingOpsByIds(chunk)
+            }
+            flushedPointIds.chunked(400).forEach { chunk ->
+                tripGpsPointDao.markPointsSynced(chunk)
+            }
+            if (syncedTransitionIds.isNotEmpty()) {
                 tripStateTransitionDao.markAllTransitionsSynced()
             }
         }
@@ -1120,11 +1599,15 @@ class MiyahnaRepository(
         mergeTripModels(local, cloud, settings)
 
     private suspend fun mergeCloudIntoLocal(cloud: CloudSnapshot) {
+        syncFleetMemberEmails(cloud.driverAccounts + _state.value.driverAccounts)
         mutateState(syncToCloudAfter = false) { s ->
-            val resolvedSettings = cloud.settings ?: s.settings
+            val resolvedSettings = migrateLegacyPlantSettings(cloud.settings ?: s.settings)
+            val filteredCloudTrips = cloud.trips.filterNot { it.id in pendingDeletedTripIds }
             val localTripsById = s.trips.associateBy { it.id }
-            val cloudTripsById = cloud.trips.associateBy { it.id }
-            val allTripIds = (s.trips.map { it.id } + cloud.trips.map { it.id }).distinct()
+            val cloudTripsById = filteredCloudTrips.associateBy { it.id }
+            val allTripIds = (s.trips.map { it.id } + filteredCloudTrips.map { it.id })
+                .distinct()
+                .filterNot { it in pendingDeletedTripIds }
             val mergedTrips = allTripIds.mapNotNull { id ->
                 mergeTrip(localTripsById[id], cloudTripsById[id], resolvedSettings)
             }
@@ -1145,15 +1628,15 @@ class MiyahnaRepository(
                 settings = resolvedSettings,
                 truck = updatedPrimary,
                 fleetTrucks = mergedFleet,
-                driverAccounts = (cloud.driverAccounts + s.driverAccounts).distinctBy { it.id },
-                customers = (cloud.customers + offlineLocalCustomers + s.customers).distinctBy { it.id },
+                driverAccounts = mergeDriverAccounts(s.driverAccounts, cloud.driverAccounts),
+                customers = (offlineLocalCustomers + cloud.customers + s.customers).distinctBy { it.id },
                 orders = (cloud.orders + s.orders).distinctBy { it.id },
                 trips = mergedTrips,
                 invoices = (cloud.invoices + s.invoices).distinctBy { it.id },
                 reconciliations = (cloud.reconciliations + s.reconciliations).distinctBy { it.id },
                 expenses = (cloud.expenses + s.expenses).distinctBy { it.id },
                 gpsEvents = (s.gpsEvents + cloud.gpsEvents).distinctBy { it.id }.sortedBy { it.timestamp }.takeLast(150),
-                notifications = (cloud.notifications + s.notifications).distinctBy { it.id }.take(250),
+                notifications = mergeNotifications(s.notifications, cloud.notifications),
                 directives = (cloud.directives + s.directives).distinctBy { it.id },
                 tripStateTransitions = mergedTransitions
             )
@@ -1162,6 +1645,7 @@ class MiyahnaRepository(
     }
 
     private suspend fun pushCloudSnapshotInternal(s: MiyahnaDomainState): Result<Int> {
+        syncFleetMemberEmails(s.driverAccounts)
         val res = cloudSync.pushFullSnapshot(
             settings = s.settings,
             truck = s.truck,
@@ -1176,7 +1660,8 @@ class MiyahnaRepository(
             gpsEvents = s.gpsEvents,
             notifications = s.notifications,
             directives = s.directives,
-            tripStateLogs = s.tripStateTransitions
+            tripStateLogs = s.tripStateTransitions,
+            driverOnlyMode = s.savedRole == AppRole.DRIVER
         )
         res.onSuccess {
             val syncedIds = s.tripStateTransitions.filterNot { it.isSyncedToCloud }.map { it.id }
@@ -1290,7 +1775,8 @@ class MiyahnaRepository(
         lat: Double,
         lng: Double,
         tankCapacityLiters: Int,
-        notes: String?
+        notes: String?,
+        isActive: Boolean? = null
     ): ActionResult<Customer> {
         val existing = customerDao.getCustomerById(customerId)?.toDomain()
             ?: _state.value.customers.firstOrNull { it.id == customerId }
@@ -1309,6 +1795,7 @@ class MiyahnaRepository(
             lng = lng,
             tankCapacityLiters = tankCapacityLiters.coerceAtLeast(500),
             notes = notes?.trim()?.takeIf { it.isNotEmpty() },
+            isActive = isActive ?: existing.isActive,
             isOfflineCreated = existing.isOfflineCreated || isOffline
         )
 
@@ -1341,6 +1828,30 @@ class MiyahnaRepository(
         return ActionResult(true)
     }
 
+    private fun findMatchingCustomer(
+        customers: List<Customer>,
+        existingCustomerId: String?,
+        customerName: String,
+        phone: String
+    ): Customer? {
+        if (!existingCustomerId.isNullOrBlank()) {
+            customers.firstOrNull { it.id == existingCustomerId }?.let { return it }
+        }
+        val cleanPhone = phone.trim()
+        val cleanName = customerName.trim()
+        if (cleanPhone.isNotEmpty()) {
+            customers.firstOrNull {
+                it.phone.trim() == cleanPhone || it.altPhone?.trim() == cleanPhone
+            }?.let { return it }
+        }
+        if (cleanName.isNotEmpty()) {
+            customers.firstOrNull {
+                it.name.trim().equals(cleanName, ignoreCase = true)
+            }?.let { return it }
+        }
+        return null
+    }
+
     suspend fun addOrder(
         existingCustomerId: String?,
         customerName: String,
@@ -1358,33 +1869,82 @@ class MiyahnaRepository(
     ): ActionResult<Order> {
         val snap = _state.value
         val cleanDistrict = district.trim().ifEmpty { AlWadiDistricts.DEFAULT_DISTRICT }
+        val cleanName = customerName.trim().ifEmpty { "عميل" }
+        val cleanPhone = phone.trim()
         addCustomDistrict(cleanDistrict)
 
-        val resolvedCustomer = if (!existingCustomerId.isNullOrBlank()) {
-            snap.customers.firstOrNull { it.id == existingCustomerId }
-        } else {
-            snap.customers.firstOrNull {
-                phone.isNotBlank() && it.phone == phone.trim() && it.name == customerName.trim()
-            }
-        }
+        val offlineNow = !checkNetworkOnlineNow() || !snap.isOnline
+        val roomCustomers = customerDao.getAllCustomersOnce().map { it.toDomain() }
+        val allKnownCustomers = (snap.customers + roomCustomers).distinctBy { it.id }
 
-        val customerId = resolvedCustomer?.id ?: addCustomer(
-            name = customerName,
-            phone = phone,
-            altPhone = null,
-            district = cleanDistrict,
-            addressDetails = addressDetails,
-            lat = lat,
-            lng = lng,
-            tankCapacityLiters = tankCapacity,
-            notes = notes
-        ).id
+        val resolvedCustomer = findMatchingCustomer(
+            customers = allKnownCustomers,
+            existingCustomerId = existingCustomerId,
+            customerName = cleanName,
+            phone = cleanPhone
+        )
+
+        val newCustomerToInsert: Customer?
+        val updatedExistingCustomer: Customer?
+        val customerId: String
+        val finalCustomerName: String
+        val finalPhone: String
+        val finalDistrict: String
+        val finalAddress: String
+        val finalLat: Double
+        val finalLng: Double
+        val finalTankCapacity: Int
+
+        if (resolvedCustomer == null) {
+            val seq = max(allKnownCustomers.size, customerDao.getCustomersCount()) + 1
+            val created = Customer(
+                id = nextId("cust"),
+                customerId = "CUST-${seq.toString().padStart(4, '0')}",
+                name = cleanName,
+                phone = cleanPhone,
+                altPhone = null,
+                district = cleanDistrict,
+                addressDetails = addressDetails.trim(),
+                lat = lat,
+                lng = lng,
+                tankCapacityLiters = tankCapacity.coerceAtLeast(500),
+                notes = notes?.trim()?.takeIf { it.isNotEmpty() },
+                createdAt = nowIso(),
+                isActive = true,
+                totalOrdersCount = 1,
+                isOfflineCreated = offlineNow
+            )
+            newCustomerToInsert = created
+            updatedExistingCustomer = null
+            customerId = created.id
+            finalCustomerName = created.name
+            finalPhone = created.phone
+            finalDistrict = created.district
+            finalAddress = created.addressDetails
+            finalLat = created.lat
+            finalLng = created.lng
+            finalTankCapacity = created.tankCapacityLiters
+        } else {
+            newCustomerToInsert = null
+            updatedExistingCustomer = resolvedCustomer.copy(
+                phone = resolvedCustomer.phone.ifBlank { cleanPhone },
+                totalOrdersCount = resolvedCustomer.totalOrdersCount + 1
+            )
+            customerId = resolvedCustomer.id
+            finalCustomerName = cleanName.ifBlank { resolvedCustomer.name }
+            finalPhone = cleanPhone.ifBlank { resolvedCustomer.phone }
+            finalDistrict = cleanDistrict.ifBlank { resolvedCustomer.district }
+            finalAddress = addressDetails.trim().ifBlank { resolvedCustomer.addressDetails }
+            finalLat = lat
+            finalLng = lng
+            finalTankCapacity = tankCapacity.coerceAtLeast(500)
+        }
 
         // 6-hour duplicate warning check
         val sixHoursAgoMs = System.currentTimeMillis() - (6 * 3600 * 1000L)
         val matchedDup = snap.orders.firstOrNull { existing ->
             existing.status != OrderStatus.CANCELLED &&
-                (existing.customerId == customerId || (phone.isNotBlank() && existing.phone == phone.trim())) &&
+                (existing.customerId == customerId || (finalPhone.isNotBlank() && existing.phone == finalPhone)) &&
                 (runCatching { Instant.parse(existing.createdAt).toEpochMilli() }.getOrDefault(0L) >= sixHoursAgoMs)
         }
 
@@ -1394,13 +1954,13 @@ class MiyahnaRepository(
             id = nextId("ord"),
             orderNumber = "ORD-${LocalDate.now().year}-${seq.toString().padStart(4, '0')}",
             customerId = customerId,
-            customerName = customerName.trim().ifEmpty { "عميل" },
-            phone = phone.trim(),
-            district = cleanDistrict,
-            addressDetails = addressDetails.trim(),
-            lat = lat,
-            lng = lng,
-            tankCapacity = tankCapacity,
+            customerName = finalCustomerName,
+            phone = finalPhone,
+            district = finalDistrict,
+            addressDetails = finalAddress,
+            lat = finalLat,
+            lng = finalLng,
+            tankCapacity = finalTankCapacity,
             requestedLiters = requestedLiters.coerceIn(250, 6000),
             pricePerLiter = unitPrice,
             totalAmount = requestedLiters.coerceIn(250, 6000) * unitPrice,
@@ -1413,7 +1973,7 @@ class MiyahnaRepository(
             duplicateMatchedOrderId = matchedDup?.orderNumber
         )
 
-        val notif = buildNotification(
+        val orderNotif = buildNotification(
             targetRole = "manager",
             actorRole = if (source == OrderSource.DRIVER_MANUAL) "driver" else "manager",
             actorName = snap.driverSession?.name ?: "الإدارة",
@@ -1424,15 +1984,40 @@ class MiyahnaRepository(
             orderId = order.id,
             actionTab = "orders"
         )
+        val customerNotif = newCustomerToInsert?.let { cust ->
+            buildNotification(
+                targetRole = "manager",
+                actorRole = if (source == OrderSource.DRIVER_MANUAL) "driver" else "manager",
+                actorName = snap.driverSession?.name ?: "الإدارة",
+                category = "customer_added",
+                priority = NotificationPriority.INFO,
+                title = "حفظ عميل جديد في قاعدة العملاء: ${cust.name}",
+                message = "${cust.district} — سعة الخزان ${cust.tankCapacityLiters} لتر",
+                actionTab = "customers"
+            )
+        }
 
         mutateState(
-            queueOfflineType = if (!snap.isOnline) "order" else null,
-            queueOfflinePayload = if (!snap.isOnline) json.encodeToString(order) else null
+            queueOfflineType = if (offlineNow) "order" else null,
+            queueOfflinePayload = if (offlineNow) json.encodeToString(order) else null
         ) { s ->
+            val updatedCustomers = when {
+                newCustomerToInsert != null -> (listOf(newCustomerToInsert) + s.customers).distinctBy { it.id }
+                updatedExistingCustomer != null -> s.customers.map {
+                    if (it.id == updatedExistingCustomer.id) updatedExistingCustomer else it
+                }
+                else -> s.customers
+            }
+            val newNotifs = listOfNotNull(orderNotif, customerNotif)
             s.copy(
+                isOnline = !offlineNow,
+                customers = updatedCustomers,
                 orders = listOf(order) + s.orders,
-                notifications = listOf(notif) + s.notifications
+                notifications = newNotifs + s.notifications
             )
+        }
+        if (offlineNow) {
+            runCatching { TripSyncWorker.enqueueWhenOnline(context) }
         }
         return ActionResult(success = true, data = order, warning = matchedDup != null)
     }
@@ -1644,12 +2229,14 @@ class MiyahnaRepository(
             tripNumber = target.tripNumber,
             actionTab = "trips"
         )
+        val offlineNow = !checkNetworkOnlineNow() || !_state.value.isOnline
         mutateState(
-            queueOfflineType = if (!_state.value.isOnline) "trip_response" else null,
-            queueOfflinePayload = if (!_state.value.isOnline) "$tripId:$accepted" else null,
+            queueOfflineType = if (offlineNow) "trip_response" else null,
+            queueOfflinePayload = if (offlineNow) "$tripId:$accepted" else null,
             syncToCloudAfter = true
         ) { s ->
             s.copy(
+                isOnline = !offlineNow,
                 trips = s.trips.map {
                     if (it.id == tripId) {
                         val auditEntry = TripAuditEntry(
@@ -1683,6 +2270,9 @@ class MiyahnaRepository(
         )
         if (accepted) {
             ensureDriverBackgroundGpsRunning(acceptedTripId = tripId, forceStart = true)
+        }
+        if (offlineNow) {
+            runCatching { TripSyncWorker.enqueueWhenOnline(context) }
         }
         return ActionResult(true)
     }
@@ -1735,12 +2325,13 @@ class MiyahnaRepository(
             sequenceNumber = snap.gpsEvents.size + 1
         )
 
+        val onlineNow = checkNetworkOnlineNow() && snap.isOnline
         val updated = target.copy(
             status = TripStatus.IN_PROGRESS,
             startedAt = now,
             startLocation = GeoLocationPoint(startLat, startLng),
             gpsPoints = (target.gpsPoints + startPt),
-            syncStatus = if (snap.isOnline) TripSyncStatus.SYNCED else TripSyncStatus.PENDING_SYNC,
+            syncStatus = if (onlineNow) TripSyncStatus.SYNCED else TripSyncStatus.PENDING_SYNC,
             auditLogs = target.auditLogs + TripAuditEntry(
                 id = nextId("aud"),
                 timestamp = now,
@@ -1750,13 +2341,14 @@ class MiyahnaRepository(
             )
         )
 
-        tripGpsPointDao.insertPoint(startPt.toEntity(isSynced = snap.isOnline && snap.cloudUser != null))
+        tripGpsPointDao.insertPoint(startPt.toEntity(isSynced = onlineNow && snap.cloudUser != null))
 
         mutateState(
-            queueOfflineType = if (!snap.isOnline) "trip_start" else null,
-            queueOfflinePayload = if (!snap.isOnline) tripId else null
+            queueOfflineType = if (!onlineNow) "trip_start" else null,
+            queueOfflinePayload = if (!onlineNow) tripId else null
         ) { s ->
             s.copy(
+                isOnline = onlineNow,
                 trips = s.trips.map { if (it.id == tripId) updated else it },
                 orders = s.orders.map { if (it.id in target.orderIds) it.copy(status = OrderStatus.IN_DELIVERY) else it },
                 truck = s.truck.copy(
@@ -2208,7 +2800,7 @@ class MiyahnaRepository(
                 tripGpsPointDao.insertPoint(
                     standbyPt.toEntity(
                         capturedAtEpochMs = nowEpoch,
-                        isSynced = onlineNow && snap.cloudUser != null
+                        isSynced = false
                     )
                 )
                 lastStandbyPointSavedMs = nowEpoch
@@ -2266,12 +2858,21 @@ class MiyahnaRepository(
                         activeTrip = null,
                         gpsEvent = standbyEvent
                     )
-                    if (pushRes.isFailure) {
+                    if (pushRes.isSuccess) {
+                        val standbyIds = runCatching {
+                            tripGpsPointDao.getUnsyncedPointsOnce()
+                                .filter { it.tripId.startsWith("driver-bg-") }
+                                .map { it.id }
+                        }.getOrDefault(emptyList())
+                        if (standbyIds.isNotEmpty()) {
+                            runCatching { tripGpsPointDao.markPointsSynced(standbyIds) }
+                        }
+                    } else {
                         lastLiveTelemetryPushMs = 0L
                         runCatching { TripSyncWorker.enqueueWhenOnline(context) }
                     }
                 }
-            } else if (!onlineNow && (stateChanged || distFromLastMeters >= 15.0)) {
+            } else if (!onlineNow || snap.cloudUser == null) {
                 runCatching { TripSyncWorker.enqueueWhenOnline(context) }
             }
             return
@@ -2299,7 +2900,7 @@ class MiyahnaRepository(
         tripGpsPointDao.insertPoint(
             persistedPoint.toEntity(
                 capturedAtEpochMs = nowEpoch,
-                isSynced = onlineNow && snap.cloudUser != null
+                isSynced = false
             )
         )
 
@@ -2354,10 +2955,20 @@ class MiyahnaRepository(
                 ReturnLocationInfo(
                     lat = lat,
                     lng = lng,
-                    distanceFromPlantMeters = readiness.geofenceRadius,
+                    distanceFromPlantMeters = readiness.currentDistanceFromPlantMeters,
                     detectedAutomatically = true
                 )
-            } else activeTrip.returnLocation
+            } else activeTrip.returnLocation,
+            auditLogs = if (readiness.qualified) {
+                activeTrip.auditLogs + TripAuditEntry(
+                    id = nextId("aud"),
+                    timestamp = now,
+                    actorRole = "system",
+                    actorName = "التتبع التلقائي",
+                    action = "تسجيل عودة وإغلاق الرحلة تلقائياً في محيط المصنع (${readiness.currentDistanceFromPlantMeters}م)",
+                    details = "المسافة المسجلة ${analysis.totalDistanceKm} كم"
+                )
+            } else activeTrip.auditLogs
         )
 
         val updatedActiveTruck = snap.truck.copy(
@@ -2425,10 +3036,22 @@ class MiyahnaRepository(
                         category = "trip_returned_plant",
                         priority = NotificationPriority.ACTION_REQUIRED,
                         title = "عاد الوايت للمصنع: ${activeTrip.tripNumber}",
-                        message = "المسافة المسجلة ${analysis.totalDistanceKm} كم (${analysis.points.size} نقطة GPS) — بانتظار المراجعة والإغلاق",
+                        message = "تم تسجيل العودة على بُعد ${readiness.currentDistanceFromPlantMeters}م (${analysis.totalDistanceKm} كم) — بانتظار المراجعة",
                         tripId = activeTrip.id,
                         tripNumber = activeTrip.tripNumber,
                         actionTab = "trips"
+                    ),
+                    buildNotification(
+                        targetRole = "driver",
+                        actorRole = "system",
+                        actorName = "التتبع التلقائي",
+                        category = "trip_auto_closed_driver",
+                        priority = NotificationPriority.INFO,
+                        title = "تم إغلاق الرحلة تلقائياً: ${activeTrip.tripNumber}",
+                        message = "تم تسجيل عودتك إلى محيط المصنع (${readiness.currentDistanceFromPlantMeters}م) وإغلاق الرحلة من واجهة السائق تلقائياً.",
+                        tripId = activeTrip.id,
+                        tripNumber = activeTrip.tripNumber,
+                        actionTab = "trip"
                     )
                 )
             } else emptyList()
@@ -2445,6 +3068,7 @@ class MiyahnaRepository(
         when {
             readiness.qualified -> {
                 autoPausedTripIds.remove(activeTrip.id)
+                LocationTrackingPrefs.clearAcceptedTripId(context)
                 recordTripStateTransition(
                     trip = updatedTrip,
                     fromState = activeTrip.status.wire,
@@ -2515,11 +3139,18 @@ class MiyahnaRepository(
                     activeTrip = updatedTrip,
                     gpsEvent = tripStopOrGapEvent
                 )
-                if (pushRes.isFailure) {
+                if (pushRes.isSuccess) {
+                    val syncedIds = updatedTrip.gpsPoints.map { it.id }
+                    if (syncedIds.isNotEmpty()) {
+                        runCatching { tripGpsPointDao.markPointsSynced(syncedIds) }
+                    }
+                } else {
                     lastLiveTelemetryPushMs = 0L
                     runCatching { TripSyncWorker.enqueueWhenOnline(context) }
                 }
             }
+        } else if (!onlineNow || snap.cloudUser == null) {
+            runCatching { TripSyncWorker.enqueueWhenOnline(context) }
         }
 
         if (readiness.qualified) {
@@ -2649,6 +3280,66 @@ class MiyahnaRepository(
             actorName = "المدير العام",
             reason = reviewNotes
         )
+    }
+
+    suspend fun deleteTrip(tripId: String): ActionResult<Unit> {
+        initJob.join()
+        val target = _state.value.trips.firstOrNull { it.id == tripId }
+            ?: return ActionResult(false, error = "الرحلة غير موجودة")
+
+        val canDelete = target.status == TripStatus.CLOSED ||
+            target.status == TripStatus.REJECTED ||
+            target.status == TripStatus.COMPLETED_PENDING_REVIEW ||
+            target.status == TripStatus.RETURNED_TO_PLANT ||
+            target.status == TripStatus.SYNCED ||
+            target.status == TripStatus.PENDING_SYNC
+        if (!canDelete) {
+            return ActionResult(false, error = "لا يمكن حذف رحلة ما زالت قيد التنفيذ — أكمل المراجعة أو أوقف الرحلة أولاً")
+        }
+
+        val onlineNow = checkNetworkOnlineNow() && _state.value.isOnline
+        pendingDeletedTripIds.add(tripId)
+        autoPausedTripIds.remove(tripId)
+        tripGpsPointDao.deletePointsForTrip(tripId)
+        tripStateTransitionDao.deleteTransitionsForTrip(tripId)
+
+        mutateState(
+            queueOfflineType = if (!onlineNow) "trip_delete" else null,
+            queueOfflinePayload = if (!onlineNow) tripId else null,
+            syncToCloudAfter = false
+        ) { s ->
+            s.copy(
+                trips = s.trips.filterNot { it.id == tripId },
+                orders = s.orders.map { ord ->
+                    if (ord.tripId == tripId && ord.status != OrderStatus.DELIVERED && ord.status != OrderStatus.CANCELLED) {
+                        ord.copy(tripId = null, status = OrderStatus.WAITING_CLUSTERING)
+                    } else ord
+                },
+                gpsEvents = s.gpsEvents.filterNot { it.tripId == tripId },
+                tripStateTransitions = s.tripStateTransitions.filterNot { it.tripId == tripId },
+                truck = if (s.truck.currentTripId == tripId) {
+                    s.truck.copy(status = TruckStatus.IDLE, currentTripId = null)
+                } else s.truck
+            )
+        }
+
+        if (onlineNow && _state.value.cloudUser != null) {
+            val res = cloudSync.deleteTripDocument(tripId)
+            if (res.isSuccess) {
+                pendingDeletedTripIds.remove(tripId)
+            } else {
+                stateDao.insertPendingOp(
+                    PendingOfflineOpEntity(
+                        id = nextId("op"),
+                        type = "trip_delete",
+                        payloadJson = tripId,
+                        createdAt = nowIso()
+                    )
+                )
+                runCatching { TripSyncWorker.enqueueWhenOnline(context) }
+            }
+        }
+        return ActionResult(true)
     }
 
     suspend fun markTransitionReviewed(logId: String, note: String? = null): ActionResult<Unit> {
@@ -3213,6 +3904,24 @@ class MiyahnaRepository(
             }
         }
         return merged.values.sortedByDescending { it.timestampEpochMs }
+    }
+
+    private fun migrateLegacyPlantSettings(settings: SystemSettings): SystemSettings {
+        val isLegacyCoords = kotlin.math.abs(settings.plantLocation.lat - 15.4920) < 0.0001 &&
+            kotlin.math.abs(settings.plantLocation.lng - 45.3620) < 0.0001
+        val nextPlant = if (isLegacyCoords) {
+            settings.plantLocation.copy(
+                city = "مديرية الوادي - مأرب",
+                lat = 15.4698538,
+                lng = 45.3636985
+            )
+        } else settings.plantLocation
+        val nextGeofence = if (isLegacyCoords && settings.plantGeofenceMeters == 120) {
+            300
+        } else settings.plantGeofenceMeters
+        return if (nextPlant != settings.plantLocation || nextGeofence != settings.plantGeofenceMeters) {
+            settings.copy(plantLocation = nextPlant, plantGeofenceMeters = nextGeofence)
+        } else settings
     }
 
     private fun nowIso(): String = Instant.now().toString()

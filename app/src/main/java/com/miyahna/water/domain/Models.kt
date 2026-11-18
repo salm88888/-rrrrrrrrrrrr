@@ -503,8 +503,8 @@ data class Truck(
     val driverName: String = "غير معين",
     val driverPhone: String = "",
     val status: TruckStatus = TruckStatus.IDLE,
-    val lastLat: Double = 15.4920,
-    val lastLng: Double = 45.3620,
+    val lastLat: Double = 15.4698538,
+    val lastLng: Double = 45.3636985,
     val lastSpeed: Double = 0.0,
     val lastUpdateTimestamp: String = "",
     val lastEvent: GPSEventType = GPSEventType.RETURN_PLANT,
@@ -515,9 +515,9 @@ data class Truck(
 @Serializable
 data class PlantLocation(
     val name: String = "مصنع مياهنا المركزي لتحلية وتعبئة المياه",
-    val city: String = "مديرية الوادي - قرب حصون آل جلال، مأرب",
-    val lat: Double = 15.4920,
-    val lng: Double = 45.3620
+    val city: String = "مديرية الوادي - مأرب",
+    val lat: Double = 15.4698538,
+    val lng: Double = 45.3636985
 )
 
 @Serializable
@@ -531,7 +531,7 @@ data class SystemSettings(
     val stopDetectionMinutes: Int = 3,
     val minMovementSpeedKmH: Double = 8.0,
     val stopRadiusMeters: Int = 80,
-    val plantGeofenceMeters: Int = 120,
+    val plantGeofenceMeters: Int = 300,
     val gpsSampleIntervalSeconds: Int = 10,
     val gpsPowerSaveEnabled: Boolean = true,
     val gpsPowerSaveIntervalSeconds: Int = 60,
@@ -553,6 +553,7 @@ data class DriverAccount(
     val username: String,
     val phone: String,
     val password: String,
+    val googleEmail: String? = null,
     val licenseNumber: String? = null,
     val status: DriverAccountStatus = DriverAccountStatus.PENDING,
     val createdAt: String,

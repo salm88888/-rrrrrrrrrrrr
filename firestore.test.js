@@ -8,7 +8,7 @@ const fs = require("node:fs");
 
 let testEnv;
 const PROJECT_ID = process.env.GCP_PROJECT || "demo-no-project";
-const DATABASE_ID = "ai-studio-android-water-65098756-0314-4193-b45a-4e23be9b2d5d";
+const DATABASE_ID = "ai-studio-a10bda36-8b0b-4d37-bbad-aba175fc020a";
 const ALICE_UID = "alice_driver_1";
 const BOB_UID = "bob_driver_2";
 const ADMIN_UID = "admin_salem_1";
@@ -362,4 +362,289 @@ test("tripStateLogs: enforces auth, owner scoping, immutable audit trail, and ma
     })
   );
 });
+
+test("Two-phone shared database: authorized driver (mixed-case email) reads & updates allowed ops fields; denied admin/financial tampering; stranger denied", async () => {
+  const DRIVER_UID = "driver_phone_2";
+  const DRIVER_EMAIL_MIXED = "DriverUser@gmail.com";
+  const DRIVER_EMAIL_LOWER = "driveruser@gmail.com";
+  const MEMBER_EMAILS = [ADMIN_EMAIL, DRIVER_EMAIL_LOWER];
+
+  const adminDb = dbFor(
+    testEnv.authenticatedContext(ADMIN_UID, {
+      email: ADMIN_EMAIL,
+      email_verified: true,
+    })
+  );
+  const driverDb = dbFor(
+    testEnv.authenticatedContext(DRIVER_UID, {
+      email: DRIVER_EMAIL_MIXED,
+      email_verified: true,
+    })
+  );
+  const strangerDb = dbFor(
+    testEnv.authenticatedContext(BOB_UID, {
+      email: "bob@example.com",
+      email_verified: true,
+    })
+  );
+
+  // Manager Phone 1 seeds shared workspace documents with memberEmails
+  await assertSucceeds(
+    adminDb.collection("settings").doc("main").set({
+      id: "main",
+      ownerId: ADMIN_UID,
+      memberEmails: MEMBER_EMAILS,
+      waterProductionCostPerLiter: 0.4,
+      defaultSellingPricePerLiter: 1.5,
+      dieselPricePerLiter: 1200,
+      plantLocation: { name: "مصنع مياهنا", city: "مأرب - الوادي", lat: 15.4855, lng: 45.362 },
+      serverCreatedAt: serverTs(),
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    adminDb.collection("trucks").doc("TRUCK-01").set({
+      id: "TRUCK-01",
+      ownerId: ADMIN_UID,
+      memberEmails: MEMBER_EMAILS,
+      code: "TRUCK-01",
+      plateNumber: "مأرب 1001",
+      maxCapacityLiters: 6000,
+      status: "idle",
+      serverCreatedAt: serverTs(),
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    adminDb.collection("driverAccounts").doc("drv_shared_1").set({
+      id: "drv_shared_1",
+      ownerId: ADMIN_UID,
+      memberEmails: MEMBER_EMAILS,
+      name: "أحمد السائق",
+      username: "ahmed",
+      phone: "777111222",
+      password: "pass1234",
+      googleEmail: DRIVER_EMAIL_LOWER,
+      status: "approved",
+      createdAt: "2026-11-18T08:00:00Z",
+      serverCreatedAt: serverTs(),
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    adminDb.collection("customers").doc("cust_shared_1").set({
+      id: "cust_shared_1",
+      ownerId: ADMIN_UID,
+      memberEmails: MEMBER_EMAILS,
+      name: "عميل مشترك",
+      phone: "777333444",
+      district: "العرقين",
+      lat: 15.48,
+      lng: 45.36,
+      tankCapacityLiters: 2000,
+      createdAt: "2026-11-18T08:00:00Z",
+      serverCreatedAt: serverTs(),
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    adminDb.collection("orders").doc("ord_shared_1").set({
+      id: "ord_shared_1",
+      ownerId: ADMIN_UID,
+      memberEmails: MEMBER_EMAILS,
+      customerName: "عميل مشترك",
+      phone: "777333444",
+      district: "العرقين",
+      requestedLiters: 2000,
+      status: "assigned",
+      createdAt: "2026-11-18T08:05:00Z",
+      serverCreatedAt: serverTs(),
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    adminDb.collection("trips").doc("trip_shared_1").set({
+      id: "trip_shared_1",
+      ownerId: ADMIN_UID,
+      memberEmails: MEMBER_EMAILS,
+      tripNumber: "TRIP-2026-0100",
+      truckId: "TRUCK-01",
+      driverId: "drv_shared_1",
+      driverName: "أحمد السائق",
+      status: "approved",
+      driverAcceptanceStatus: "pending",
+      customerStops: [],
+      orderIds: ["ord_shared_1"],
+      proposedAt: "2026-11-18T08:10:00Z",
+      serverCreatedAt: serverTs(),
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    adminDb.collection("directives").doc("dir_shared_1").set({
+      id: "dir_shared_1",
+      ownerId: ADMIN_UID,
+      memberEmails: MEMBER_EMAILS,
+      createdAt: "2026-11-18T08:11:00Z",
+      createdBy: "المدير العام",
+      title: "توجه للعميل",
+      message: "التوصيل صباحاً",
+      status: "sent",
+      serverCreatedAt: serverTs(),
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    adminDb.collection("notifications").doc("notif_shared_1").set({
+      id: "notif_shared_1",
+      ownerId: ADMIN_UID,
+      memberEmails: MEMBER_EMAILS,
+      createdAt: "2026-11-18T08:11:00Z",
+      targetRole: "driver",
+      title: "رحلة جديدة",
+      message: "تم إسناد رحلة جديدة",
+      isRead: false,
+      serverCreatedAt: serverTs(),
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    adminDb.collection("invoices").doc("inv_private_1").set({
+      id: "inv_private_1",
+      ownerId: ADMIN_UID,
+      invoiceNumber: "INV-0100",
+      tripId: "trip_shared_1",
+      customerName: "عميل مشترك",
+      totalAmount: 3000,
+      createdAt: "2026-11-18T08:12:00Z",
+      serverCreatedAt: serverTs(),
+      serverUpdatedAt: serverTs(),
+    })
+  );
+
+  // Driver Phone 2 queries shared collections via array-contains & reads settings/main
+  await assertSucceeds(driverDb.collection("settings").doc("main").get());
+  await assertSucceeds(driverDb.collection("settings").where("memberEmails", "array-contains", DRIVER_EMAIL_LOWER).get());
+  await assertSucceeds(driverDb.collection("trucks").where("memberEmails", "array-contains", DRIVER_EMAIL_LOWER).get());
+  await assertSucceeds(driverDb.collection("driverAccounts").where("memberEmails", "array-contains", DRIVER_EMAIL_LOWER).get());
+  await assertSucceeds(driverDb.collection("trips").where("memberEmails", "array-contains", DRIVER_EMAIL_LOWER).get());
+  await assertSucceeds(driverDb.collection("orders").where("memberEmails", "array-contains", DRIVER_EMAIL_LOWER).get());
+  await assertSucceeds(driverDb.collection("directives").where("memberEmails", "array-contains", DRIVER_EMAIL_LOWER).get());
+  await assertSucceeds(driverDb.collection("notifications").where("memberEmails", "array-contains", DRIVER_EMAIL_LOWER).get());
+  await assertSucceeds(driverDb.collection("customers").where("memberEmails", "array-contains", DRIVER_EMAIL_LOWER).get());
+
+  // Driver Phone 2 can perform allowed operational updates
+  await assertSucceeds(
+    driverDb.collection("trucks").doc("TRUCK-01").update({
+      status: "on_trip",
+      lastLat: 15.491,
+      lastLng: 45.366,
+      lastSpeed: 38.5,
+      lastUpdateTimestamp: "2026-11-18T08:20:00Z",
+      currentTripId: "trip_shared_1",
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    driverDb.collection("trips").doc("trip_shared_1").update({
+      driverAcceptanceStatus: "accepted",
+      driverRespondedAt: "2026-11-18T08:15:00Z",
+      status: "in_progress",
+      startedAt: "2026-11-18T08:16:00Z",
+      gpsPoints: [{ id: "pt1", tripId: "trip_shared_1", lat: 15.491, lng: 45.366, speedKmH: 38.5, timestamp: "2026-11-18T08:20:00Z", seq: 1 }],
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    driverDb.collection("orders").doc("ord_shared_1").update({
+      status: "in_delivery",
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    driverDb.collection("directives").doc("dir_shared_1").update({
+      status: "acknowledged",
+      acknowledgedAt: "2026-11-18T08:17:00Z",
+      driverReply: "تم الاستلام",
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    driverDb.collection("notifications").doc("notif_shared_1").update({
+      isRead: true,
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertSucceeds(
+    driverDb.collection("driverAccounts").doc("drv_shared_1").update({
+      lastLoginAt: "2026-11-18T08:14:00Z",
+      serverUpdatedAt: serverTs(),
+    })
+  );
+
+  // Driver Phone 2 is DENIED mutating Manager settings, customers, invoices, or protected fields
+  await assertFails(
+    driverDb.collection("settings").doc("main").update({
+      defaultSellingPricePerLiter: 99,
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertFails(
+    driverDb.collection("customers").doc("cust_shared_1").update({
+      name: "Hacked Name",
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertFails(driverDb.collection("invoices").doc("inv_private_1").get());
+  await assertFails(
+    driverDb.collection("trips").doc("trip_shared_1").update({
+      approvedBy: "Fake Admin",
+      closedAt: "2026-11-18T09:00:00Z",
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertFails(
+    driverDb.collection("trips").doc("trip_shared_1").update({
+      memberEmails: [DRIVER_EMAIL_LOWER],
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertFails(
+    driverDb.collection("trips").doc("trip_shared_1").update({
+      ownerId: DRIVER_UID,
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertFails(
+    driverDb.collection("driverAccounts").doc("drv_shared_1").update({
+      status: "rejected",
+      serverUpdatedAt: serverTs(),
+    })
+  );
+  await assertFails(
+    driverDb.collection("notifications").doc("notif_shared_1").update({
+      title: "Tampered Title",
+      serverUpdatedAt: serverTs(),
+    })
+  );
+
+  // Unauthorized stranger (bob@example.com) querying own email sees 0 docs; cannot read/query/update Manager/Driver docs
+  await assertFails(strangerDb.collection("settings").doc("main").get());
+  await assertFails(strangerDb.collection("trips").doc("trip_shared_1").get());
+  const bobEmptySnap = await assertSucceeds(
+    strangerDb.collection("trips").where("memberEmails", "array-contains", "bob@example.com").get()
+  );
+  if (bobEmptySnap.size !== 0) {
+    throw new Error(`Expected 0 docs for stranger, got ${bobEmptySnap.size}`);
+  }
+  await assertFails(strangerDb.collection("trips").where("memberEmails", "array-contains", DRIVER_EMAIL_LOWER).get());
+  await assertFails(strangerDb.collection("trips").get());
+  await assertFails(
+    strangerDb.collection("trips").doc("trip_shared_1").update({
+      status: "paused",
+      serverUpdatedAt: serverTs(),
+    })
+  );
+});
+
 

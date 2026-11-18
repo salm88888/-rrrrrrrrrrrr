@@ -55,8 +55,8 @@ object FleetFilterEngine {
                     driverId = trip.driverId,
                     driverName = trip.driverName,
                     status = if (isActiveOrPaused) TruckStatus.ON_TRIP else TruckStatus.IDLE,
-                    lastLat = lastPt?.lat ?: trip.startLocation?.lat ?: 15.4920,
-                    lastLng = lastPt?.lng ?: trip.startLocation?.lng ?: 45.3620,
+                    lastLat = lastPt?.lat ?: trip.startLocation?.lat ?: 15.4698538,
+                    lastLng = lastPt?.lng ?: trip.startLocation?.lng ?: 45.3636985,
                     lastSpeed = lastPt?.speedKmH ?: 0.0,
                     lastUpdateTimestamp = lastPt?.timestamp ?: trip.startedAt ?: trip.proposedAt,
                     currentTripId = if (isActiveOrPaused) trip.id else null,
@@ -81,8 +81,8 @@ object FleetFilterEngine {
                 } else {
                     t
                 }
-                val safeLat = if (updated.lastLat.isFinite()) updated.lastLat else 15.4920
-                val safeLng = if (updated.lastLng.isFinite()) updated.lastLng else 45.3620
+                val safeLat = if (updated.lastLat.isFinite()) updated.lastLat else 15.4698538
+                val safeLng = if (updated.lastLng.isFinite()) updated.lastLng else 45.3636985
                 val safeSpeed = if (updated.lastSpeed.isFinite()) updated.lastSpeed else 0.0
                 if (safeLat != updated.lastLat || safeLng != updated.lastLng || safeSpeed != updated.lastSpeed) {
                     updated.copy(lastLat = safeLat, lastLng = safeLng, lastSpeed = safeSpeed)

@@ -387,6 +387,7 @@ private fun FleetMapCard(
                     plantLocation = domain.settings.plantLocation,
                     geofenceMeters = domain.settings.plantGeofenceMeters,
                     customers = domain.customers,
+                    orders = domain.orders,
                     truck = domain.truck,
                     trucks = filteredTrucks,
                     selectedTruckId = selectedTruck?.id,

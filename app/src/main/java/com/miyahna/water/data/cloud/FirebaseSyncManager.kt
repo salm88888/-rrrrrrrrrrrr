@@ -17,6 +17,7 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.auth
+import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreSettings
@@ -25,6 +26,7 @@ import com.google.firebase.firestore.Query
 import com.miyahna.water.R
 import com.miyahna.water.domain.AppNotification
 import com.miyahna.water.domain.Customer
+import com.miyahna.water.domain.DirectiveStatus
 import com.miyahna.water.domain.DriverAccount
 import com.miyahna.water.domain.DriverAccountStatus
 import com.miyahna.water.domain.DriverReconciliation
@@ -33,9 +35,11 @@ import com.miyahna.water.domain.GPSEvent
 import com.miyahna.water.domain.Invoice
 import com.miyahna.water.domain.ManagerDirective
 import com.miyahna.water.domain.Order
+import com.miyahna.water.domain.OrderStatus
 import com.miyahna.water.domain.SystemSettings
 import com.miyahna.water.domain.Trip
 import com.miyahna.water.domain.TripStateTransition
+import com.miyahna.water.domain.TripStatus
 import com.miyahna.water.domain.Truck
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -45,7 +49,6 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
-import java.time.Instant
 import kotlinx.serialization.DeserializationStrategy
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -57,6 +60,7 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.longOrNull
+import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 
 data class CloudSnapshot(
@@ -97,16 +101,39 @@ class FirebaseSyncManager(
 
     private data class KnownDocMeta(
         val ownerId: String,
-        val serverCreatedAt: Any
+        val serverCreatedAt: Any,
+        val memberEmails: List<String>? = null,
+        val docStatus: String? = null,
+        val isRead: Boolean? = null
     )
+
+    private sealed class BatchWriteOp {
+        abstract val col: String
+        abstract val id: String
+
+        data class SetDoc(
+            override val col: String,
+            override val id: String,
+            val payload: Map<String, Any>
+        ) : BatchWriteOp()
+
+        data class UpdateDoc(
+            override val col: String,
+            override val id: String,
+            val fields: Map<String, Any>
+        ) : BatchWriteOp()
+    }
 
     private val knownMeta = ConcurrentHashMap<String, KnownDocMeta>()
     private val bootstrappedAdminEmail: String =
-        context.getString(R.string.bootstrapped_admin_email)
+        context.getString(R.string.bootstrapped_admin_email).trim()
     private val databaseId: String =
         context.getString(R.string.firestore_database_id)
     private val webClientId: String =
         context.getString(R.string.default_web_client_id)
+
+    @Volatile
+    private var fleetMemberEmails: Set<String> = setOf(bootstrappedAdminEmail.lowercase())
 
     private val app: FirebaseApp by lazy {
         FirebaseApp.getApps(context).firstOrNull()
@@ -134,6 +161,19 @@ class FirebaseSyncManager(
             instance
         }
     }
+
+    fun setFleetMemberEmails(emails: Collection<String>) {
+        val normalized = linkedSetOf(bootstrappedAdminEmail.lowercase())
+        emails.forEach { raw ->
+            val clean = raw.trim().lowercase()
+            if (clean.contains("@") && clean.length <= 254) {
+                normalized.add(clean)
+            }
+        }
+        fleetMemberEmails = normalized.take(25).toSet()
+    }
+
+    fun hasPopulatedMeta(): Boolean = knownMeta.isNotEmpty()
 
     fun currentCloudUser(): CloudUserInfo? {
         val user = auth.currentUser ?: return null
@@ -251,7 +291,7 @@ class FirebaseSyncManager(
     }
 
     private suspend fun bootstrapUserDocs(user: FirebaseUser) {
-        val isBootAdmin = user.email?.equals(bootstrappedAdminEmail, ignoreCase = true) == true
+        val isBootAdmin = isBootstrappedAdmin(user)
         val role = if (isBootAdmin) "manager" else "driver"
         val userPath = "users/${user.uid}"
         val userRef = db.collection("users").document(user.uid)
@@ -303,21 +343,28 @@ class FirebaseSyncManager(
     }
 
     private fun isBootstrappedAdmin(user: FirebaseUser): Boolean =
-        user.email?.equals(bootstrappedAdminEmail, ignoreCase = true) == true
+        user.email?.trim()?.equals(bootstrappedAdminEmail, ignoreCase = true) == true
 
     private fun collectionQuery(colName: String, user: FirebaseUser): Query {
         val ref = db.collection(colName)
-        return if (isBootstrappedAdmin(user)) ref else ref.whereEqualTo("ownerId", user.uid)
+        if (isBootstrappedAdmin(user)) return ref
+        val emailLower = user.email?.trim()?.lowercase().orEmpty()
+        return if (colName in SHARED_COLLECTIONS && emailLower.isNotBlank()) {
+            ref.whereArrayContains("memberEmails", emailLower)
+        } else {
+            ref.whereEqualTo("ownerId", user.uid)
+        }
     }
 
     private suspend fun <T> fetchCollection(
         colName: String,
         user: FirebaseUser,
-        deserializer: DeserializationStrategy<T>
+        deserializer: DeserializationStrategy<T>,
+        sortDocs: (List<DocumentSnapshot>) -> List<DocumentSnapshot> = { it }
     ): List<T> {
         return try {
             val snap = collectionQuery(colName, user).get().await()
-            decodeSnapshotDocs(colName, snap.documents, deserializer)
+            decodeSnapshotDocs(colName, sortDocs(snap.documents), deserializer)
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.LIST, colName, auth)
             throw e
@@ -326,18 +373,31 @@ class FirebaseSyncManager(
 
     private fun <T> decodeSnapshotDocs(
         colName: String,
-        documents: List<com.google.firebase.firestore.DocumentSnapshot>,
+        documents: List<DocumentSnapshot>,
         deserializer: DeserializationStrategy<T>
     ): List<T> {
         return documents.mapNotNull { doc ->
             val data = doc.data ?: return@mapNotNull null
             val ownerId = data["ownerId"] as? String
             val createdAt = data["serverCreatedAt"]
+            val memberEmails = (data["memberEmails"] as? List<*>)
+                ?.mapNotNull { (it as? String)?.trim()?.lowercase()?.takeIf(String::isNotEmpty) }
+            val docStatus = data["status"] as? String
+            val isRead = data["isRead"] as? Boolean
             if (ownerId != null && createdAt != null) {
-                knownMeta["$colName/${doc.id}"] = KnownDocMeta(ownerId, createdAt)
+                knownMeta["$colName/${doc.id}"] = KnownDocMeta(
+                    ownerId = ownerId,
+                    serverCreatedAt = createdAt,
+                    memberEmails = memberEmails,
+                    docStatus = docStatus,
+                    isRead = isRead
+                )
             }
             val cleanMap = data.filterKeys {
-                it != "ownerId" && it != "serverCreatedAt" && it != "serverUpdatedAt"
+                it != "ownerId" &&
+                    it != "serverCreatedAt" &&
+                    it != "serverUpdatedAt" &&
+                    it != "memberEmails"
             }
             val jsonElem = mapToJsonObject(cleanMap)
             runCatching { json.decodeFromJsonElement(deserializer, jsonElem) }
@@ -349,7 +409,9 @@ class FirebaseSyncManager(
     suspend fun pullCloudSnapshot(): Result<CloudSnapshot> = runCatching {
         val user = requireVerifiedUser()
 
-        val settings = fetchCollection("settings", user, SystemSettings.serializer())
+        val settings = fetchCollection("settings", user, SystemSettings.serializer()) { docs ->
+            docs.sortedByDescending { it.id == "main" }
+        }
         val trucks = fetchCollection("trucks", user, Truck.serializer())
         val drivers = fetchCollection("driverAccounts", user, DriverAccount.serializer())
         val customers = fetchCollection("customers", user, Customer.serializer())
@@ -394,7 +456,8 @@ class FirebaseSyncManager(
     private fun <T> observeCollection(
         colName: String,
         deserializer: DeserializationStrategy<T>,
-        requireAuthInClient: Boolean = true
+        requireAuthInClient: Boolean = true,
+        sortDocs: (List<DocumentSnapshot>) -> List<DocumentSnapshot> = { it }
     ): Flow<List<T>> = callbackFlow {
         val user = auth.currentUser
         val query: Query = if (user == null || !user.isEmailVerified) {
@@ -415,11 +478,16 @@ class FirebaseSyncManager(
                 return@addSnapshotListener
             }
             if (snapshot != null) {
-                trySend(decodeSnapshotDocs(colName, snapshot.documents, deserializer))
+                trySend(decodeSnapshotDocs(colName, sortDocs(snapshot.documents), deserializer))
             }
         }
         awaitClose { registration.remove() }
     }
+
+    fun observeRealTimeSettings(requireAuth: Boolean = true): Flow<SystemSettings?> =
+        observeCollection("settings", SystemSettings.serializer(), requireAuth) { docs ->
+            docs.sortedByDescending { it.id == "main" }
+        }.map { it.firstOrNull() }
 
     fun observeRealTimeTrucks(requireAuth: Boolean = true): Flow<List<Truck>> =
         observeCollection("trucks", Truck.serializer(), requireAuth)
@@ -486,9 +554,17 @@ class FirebaseSyncManager(
         val user = requireVerifiedUser()
         val docId = sanitizeDocId(truck.id.ifBlank { truck.code.ifBlank { "TRUCK-01" } }, "truck")
         val path = "trucks/$docId"
-        val payload = serializeWithAudit("trucks", docId, json.encodeToJsonElement(truck), user)
+        val meta = knownMeta[path]
+        val isForeignSharedMember = !isBootstrappedAdmin(user) && meta != null && meta.ownerId != user.uid
         try {
-            db.collection("trucks").document(docId).set(payload).await()
+            if (isForeignSharedMember) {
+                db.collection("trucks").document(docId)
+                    .update(buildDriverTruckUpdateMap(truck))
+                    .await()
+            } else {
+                val payload = serializeWithAudit("trucks", docId, json.encodeToJsonElement(truck), user)
+                db.collection("trucks").document(docId).set(payload).await()
+            }
             docId
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.WRITE, path, auth)
@@ -501,9 +577,19 @@ class FirebaseSyncManager(
         val docId = sanitizeDocId(trip.id, "trip")
         val path = "trips/$docId"
         val trimmed = trimTripArrays(trip)
-        val payload = serializeWithAudit("trips", docId, json.encodeToJsonElement(trimmed), user)
+        val meta = knownMeta[path]
+        val isForeignSharedMember = !isBootstrappedAdmin(user) && meta != null && meta.ownerId != user.uid
         try {
-            db.collection("trips").document(docId).set(payload).await()
+            if (isForeignSharedMember) {
+                if (meta?.docStatus != "closed") {
+                    db.collection("trips").document(docId)
+                        .update(buildDriverTripUpdateMap(trimmed))
+                        .await()
+                }
+            } else {
+                val payload = serializeWithAudit("trips", docId, json.encodeToJsonElement(trimmed), user)
+                db.collection("trips").document(docId).set(payload).await()
+            }
             docId
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.WRITE, path, auth)
@@ -583,17 +669,32 @@ class FirebaseSyncManager(
         gpsEvent: GPSEvent? = null
     ): Result<Unit> = runCatching {
         val user = requireVerifiedUser()
+        val adminUser = isBootstrappedAdmin(user)
         val batch = db.batch()
 
         val truckDocId = sanitizeDocId(truck.id.ifBlank { truck.code.ifBlank { "TRUCK-01" } }, "truck")
-        val truckPayload = serializeWithAudit("trucks", truckDocId, json.encodeToJsonElement(truck), user)
-        batch.set(db.collection("trucks").document(truckDocId), truckPayload)
+        val truckRef = db.collection("trucks").document(truckDocId)
+        val truckMeta = knownMeta["trucks/$truckDocId"]
+        if (!adminUser && truckMeta != null && truckMeta.ownerId != user.uid) {
+            batch.update(truckRef, buildDriverTruckUpdateMap(truck))
+        } else {
+            val truckPayload = serializeWithAudit("trucks", truckDocId, json.encodeToJsonElement(truck), user)
+            batch.set(truckRef, truckPayload)
+        }
 
         if (activeTrip != null) {
             val tripDocId = sanitizeDocId(activeTrip.id, "trip")
             val trimmedTrip = trimTripArrays(activeTrip)
-            val tripPayload = serializeWithAudit("trips", tripDocId, json.encodeToJsonElement(trimmedTrip), user)
-            batch.set(db.collection("trips").document(tripDocId), tripPayload)
+            val tripRef = db.collection("trips").document(tripDocId)
+            val tripMeta = knownMeta["trips/$tripDocId"]
+            if (!adminUser && tripMeta != null && tripMeta.ownerId != user.uid) {
+                if (tripMeta.docStatus != "closed") {
+                    batch.update(tripRef, buildDriverTripUpdateMap(trimmedTrip))
+                }
+            } else {
+                val tripPayload = serializeWithAudit("trips", tripDocId, json.encodeToJsonElement(trimmedTrip), user)
+                batch.set(tripRef, tripPayload)
+            }
         }
 
         if (gpsEvent != null) {
@@ -630,89 +731,195 @@ class FirebaseSyncManager(
         gpsEvents: List<GPSEvent>,
         notifications: List<AppNotification>,
         directives: List<ManagerDirective>,
-        tripStateLogs: List<TripStateTransition> = emptyList()
+        tripStateLogs: List<TripStateTransition> = emptyList(),
+        driverOnlyMode: Boolean = false
     ): Result<Int> = runCatching {
         val user = requireVerifiedUser()
-        val items = mutableListOf<Triple<String, String, Map<String, Any>>>()
+        val adminUser = isBootstrappedAdmin(user)
+        val driverScoped = driverOnlyMode || !adminUser
+        val ops = mutableListOf<BatchWriteOp>()
 
-        val settingsId = if (isBootstrappedAdmin(user)) "main" else sanitizeDocId("cfg_${user.uid}", "cfg")
-        items.add(Triple("settings", settingsId, serializeWithAudit("settings", settingsId, json.encodeToJsonElement(settings), user)))
+        if (!driverScoped && adminUser) {
+            ops.add(
+                BatchWriteOp.SetDoc(
+                    col = "settings",
+                    id = "main",
+                    payload = serializeWithAudit("settings", "main", json.encodeToJsonElement(settings), user)
+                )
+            )
+        }
 
-        val allTrucks = (listOf(truck) + fleetTrucks).distinctBy { it.id }
-        allTrucks.forEach { t ->
+        val trucksToPush = if (driverScoped) {
+            listOf(truck)
+        } else {
+            (listOf(truck) + fleetTrucks).distinctBy { it.id }
+        }
+        trucksToPush.forEach { t ->
             val tId = sanitizeDocId(t.id.ifBlank { t.code.ifBlank { "TRUCK-01" } }, "truck")
-            items.add(Triple("trucks", tId, serializeWithAudit("trucks", tId, json.encodeToJsonElement(t), user)))
+            val meta = knownMeta["trucks/$tId"]
+            if (!adminUser && meta != null && meta.ownerId != user.uid) {
+                ops.add(BatchWriteOp.UpdateDoc("trucks", tId, buildDriverTruckUpdateMap(t)))
+            } else {
+                ops.add(BatchWriteOp.SetDoc("trucks", tId, serializeWithAudit("trucks", tId, json.encodeToJsonElement(t), user)))
+            }
         }
 
         driverAccounts.forEach { acc ->
-            if (!isBootstrappedAdmin(user) && acc.status != DriverAccountStatus.PENDING) {
-                val k = "driverAccounts/${sanitizeDocId(acc.id, "drv")}"
-                if (!knownMeta.containsKey(k)) return@forEach
-            }
             val id = sanitizeDocId(acc.id, "drv")
-            items.add(Triple("driverAccounts", id, serializeWithAudit("driverAccounts", id, json.encodeToJsonElement(acc), user)))
+            val meta = knownMeta["driverAccounts/$id"]
+            if (adminUser) {
+                ops.add(BatchWriteOp.SetDoc("driverAccounts", id, serializeWithAudit("driverAccounts", id, json.encodeToJsonElement(acc), user)))
+            } else if (meta == null && acc.status == DriverAccountStatus.PENDING) {
+                ops.add(BatchWriteOp.SetDoc("driverAccounts", id, serializeWithAudit("driverAccounts", id, json.encodeToJsonElement(acc), user)))
+            } else if (meta != null && meta.ownerId != user.uid && !acc.lastLoginAt.isNullOrBlank()) {
+                ops.add(
+                    BatchWriteOp.UpdateDoc(
+                        "driverAccounts",
+                        id,
+                        mapOf(
+                            "lastLoginAt" to acc.lastLoginAt,
+                            "serverUpdatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
+                )
+            }
         }
+
         customers.forEach { c ->
             val id = sanitizeDocId(c.id, "cust")
-            items.add(Triple("customers", id, serializeWithAudit("customers", id, json.encodeToJsonElement(c), user)))
+            val meta = knownMeta["customers/$id"]
+            if (!driverScoped || c.isOfflineCreated || meta == null || meta.ownerId == user.uid) {
+                if (adminUser || meta == null || meta.ownerId == user.uid) {
+                    ops.add(BatchWriteOp.SetDoc("customers", id, serializeWithAudit("customers", id, json.encodeToJsonElement(c), user)))
+                }
+            }
         }
+
         orders.forEach { o ->
             val id = sanitizeDocId(o.id, "ord")
-            items.add(Triple("orders", id, serializeWithAudit("orders", id, json.encodeToJsonElement(o), user)))
+            val meta = knownMeta["orders/$id"]
+            if (adminUser) {
+                ops.add(BatchWriteOp.SetDoc("orders", id, serializeWithAudit("orders", id, json.encodeToJsonElement(o), user)))
+            } else if (meta == null || meta.ownerId == user.uid) {
+                if (meta?.docStatus !in listOf("delivered", "cancelled")) {
+                    ops.add(BatchWriteOp.SetDoc("orders", id, serializeWithAudit("orders", id, json.encodeToJsonElement(o), user)))
+                }
+            } else if (meta.docStatus !in listOf("delivered", "cancelled") && o.status == OrderStatus.IN_DELIVERY) {
+                ops.add(
+                    BatchWriteOp.UpdateDoc(
+                        "orders",
+                        id,
+                        mapOf(
+                            "status" to o.status.wire,
+                            "serverUpdatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
+                )
+            }
         }
+
         trips.forEach { t ->
             val id = sanitizeDocId(t.id, "trip")
+            val meta = knownMeta["trips/$id"]
             val trimmed = trimTripArrays(t)
-            items.add(Triple("trips", id, serializeWithAudit("trips", id, json.encodeToJsonElement(trimmed), user)))
+            if (adminUser) {
+                ops.add(BatchWriteOp.SetDoc("trips", id, serializeWithAudit("trips", id, json.encodeToJsonElement(trimmed), user)))
+            } else if (meta?.docStatus != "closed") {
+                if (meta == null || meta.ownerId == user.uid) {
+                    ops.add(BatchWriteOp.SetDoc("trips", id, serializeWithAudit("trips", id, json.encodeToJsonElement(trimmed), user)))
+                } else if (t.status != TripStatus.CLOSED) {
+                    ops.add(BatchWriteOp.UpdateDoc("trips", id, buildDriverTripUpdateMap(trimmed)))
+                }
+            }
         }
-        invoices.forEach { inv ->
-            val id = sanitizeDocId(inv.id, "inv")
-            items.add(Triple("invoices", id, serializeWithAudit("invoices", id, json.encodeToJsonElement(inv), user)))
+
+        if (!driverScoped && adminUser) {
+            invoices.forEach { inv ->
+                val id = sanitizeDocId(inv.id, "inv")
+                ops.add(BatchWriteOp.SetDoc("invoices", id, serializeWithAudit("invoices", id, json.encodeToJsonElement(inv), user)))
+            }
+            reconciliations.forEach { rec ->
+                val id = sanitizeDocId(rec.id, "rec")
+                ops.add(BatchWriteOp.SetDoc("reconciliations", id, serializeWithAudit("reconciliations", id, json.encodeToJsonElement(rec), user)))
+            }
+            expenses.forEach { exp ->
+                val id = sanitizeDocId(exp.id, "exp")
+                ops.add(BatchWriteOp.SetDoc("expenses", id, serializeWithAudit("expenses", id, json.encodeToJsonElement(exp), user)))
+            }
         }
-        reconciliations.forEach { rec ->
-            val id = sanitizeDocId(rec.id, "rec")
-            items.add(Triple("reconciliations", id, serializeWithAudit("reconciliations", id, json.encodeToJsonElement(rec), user)))
-        }
-        expenses.forEach { exp ->
-            val id = sanitizeDocId(exp.id, "exp")
-            items.add(Triple("expenses", id, serializeWithAudit("expenses", id, json.encodeToJsonElement(exp), user)))
-        }
+
         gpsEvents.takeLast(100).forEach { ev ->
             val id = sanitizeDocId(ev.id, "gps")
-            items.add(Triple("gpsEvents", id, serializeWithAudit("gpsEvents", id, json.encodeToJsonElement(ev), user)))
+            val meta = knownMeta["gpsEvents/$id"]
+            if (adminUser || meta == null) {
+                ops.add(BatchWriteOp.SetDoc("gpsEvents", id, serializeWithAudit("gpsEvents", id, json.encodeToJsonElement(ev), user)))
+            }
         }
+
         notifications.take(150).forEach { n ->
             val id = sanitizeDocId(n.id, "notif")
-            items.add(Triple("notifications", id, serializeWithAudit("notifications", id, json.encodeToJsonElement(n), user)))
+            val meta = knownMeta["notifications/$id"]
+            if (adminUser || meta == null || meta.ownerId == user.uid) {
+                ops.add(BatchWriteOp.SetDoc("notifications", id, serializeWithAudit("notifications", id, json.encodeToJsonElement(n), user)))
+            } else if (n.isRead && meta.isRead != true) {
+                ops.add(
+                    BatchWriteOp.UpdateDoc(
+                        "notifications",
+                        id,
+                        mapOf(
+                            "isRead" to true,
+                            "serverUpdatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
+                )
+            }
         }
+
         directives.forEach { d ->
             val id = sanitizeDocId(d.id, "dir")
-            items.add(Triple("directives", id, serializeWithAudit("directives", id, json.encodeToJsonElement(d), user)))
+            val meta = knownMeta["directives/$id"]
+            if (adminUser) {
+                ops.add(BatchWriteOp.SetDoc("directives", id, serializeWithAudit("directives", id, json.encodeToJsonElement(d), user)))
+            } else if (meta != null && meta.ownerId != user.uid && meta.docStatus != "completed" &&
+                (d.status != DirectiveStatus.SENT || !d.driverReply.isNullOrBlank())
+            ) {
+                ops.add(BatchWriteOp.UpdateDoc("directives", id, buildDriverDirectiveUpdateMap(d)))
+            } else if (meta == null && !driverScoped) {
+                ops.add(BatchWriteOp.SetDoc("directives", id, serializeWithAudit("directives", id, json.encodeToJsonElement(d), user)))
+            }
         }
-        val adminUser = isBootstrappedAdmin(user)
+
         tripStateLogs.take(250).forEach { entry ->
             val id = sanitizeDocId(entry.id, "tlog")
             val alreadyKnown = knownMeta.containsKey("tripStateLogs/$id")
             if (alreadyKnown && (entry.isSyncedToCloud || (entry.reviewedByManager && !adminUser))) {
                 return@forEach
             }
-            items.add(Triple("tripStateLogs", id, serializeTripStateLogPayload(id, entry, user)))
+            if (!alreadyKnown || adminUser) {
+                ops.add(BatchWriteOp.SetDoc("tripStateLogs", id, serializeTripStateLogPayload(id, entry, user)))
+            }
         }
 
-        items.chunked(350).forEach { chunk ->
+        if (ops.isEmpty()) return@runCatching 0
+
+        ops.chunked(350).forEach { chunk ->
             val batch = db.batch()
-            chunk.forEach { (col, id, payload) ->
-                batch.set(db.collection(col).document(id), payload)
+            chunk.forEach { op ->
+                val ref = db.collection(op.col).document(op.id)
+                when (op) {
+                    is BatchWriteOp.SetDoc -> batch.set(ref, op.payload)
+                    is BatchWriteOp.UpdateDoc -> batch.update(ref, op.fields)
+                }
             }
             try {
                 batch.commit().await()
             } catch (e: Exception) {
-                val samplePath = chunk.firstOrNull()?.let { "${it.first}/${it.second}" }
+                val samplePath = chunk.firstOrNull()?.let { "${it.col}/${it.id}" }
                 handleFirestoreError(e, OperationType.WRITE, samplePath, auth)
                 throw e
             }
         }
-        items.size
+        ops.size
     }
 
     suspend fun deleteCustomerDocument(customerId: String): Result<Unit> = runCatching {
@@ -728,6 +935,73 @@ class FirebaseSyncManager(
             throw e
         }
         Unit
+    }
+
+    suspend fun deleteTripDocument(tripId: String): Result<Unit> = runCatching {
+        val user = auth.currentUser ?: return@runCatching
+        if (!user.isEmailVerified) return@runCatching
+        val docId = sanitizeDocId(tripId, "trip")
+        val path = "trips/$docId"
+        knownMeta.remove(path)
+        try {
+            db.collection("trips").document(docId).delete().await()
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.DELETE, path, auth)
+            throw e
+        }
+        Unit
+    }
+
+    private fun buildDriverTruckUpdateMap(truck: Truck): Map<String, Any> {
+        val elem = json.encodeToJsonElement(truck)
+        val raw = jsonElementToKotlin(elem) as? Map<*, *> ?: emptyMap<String, Any>()
+        val out = linkedMapOf<String, Any>()
+        DRIVER_TRUCK_UPDATE_KEYS.forEach { key ->
+            val v = raw[key]
+            if (v != null) out[key] = v
+        }
+        out["serverUpdatedAt"] = FieldValue.serverTimestamp()
+        return out
+    }
+
+    private fun buildDriverTripUpdateMap(trip: Trip): Map<String, Any> {
+        val elem = json.encodeToJsonElement(trip)
+        val raw = jsonElementToKotlin(elem) as? Map<*, *> ?: emptyMap<String, Any>()
+        val out = linkedMapOf<String, Any>()
+        DRIVER_TRIP_UPDATE_KEYS.forEach { key ->
+            val v = raw[key]
+            if (v != null) out[key] = v
+        }
+        out["serverUpdatedAt"] = FieldValue.serverTimestamp()
+        return out
+    }
+
+    private fun buildDriverDirectiveUpdateMap(directive: ManagerDirective): Map<String, Any> {
+        val out = linkedMapOf<String, Any>(
+            "status" to directive.status.wire,
+            "serverUpdatedAt" to FieldValue.serverTimestamp()
+        )
+        directive.acknowledgedAt?.let { out["acknowledgedAt"] = it }
+        directive.completedAt?.let { out["completedAt"] = it }
+        directive.driverReply?.takeIf { it.isNotBlank() }?.let { out["driverReply"] = it.take(1000) }
+        return out
+    }
+
+    private fun buildMemberEmails(
+        user: FirebaseUser,
+        existingMembers: List<String>?
+    ): List<String> {
+        val merged = linkedSetOf(bootstrappedAdminEmail.lowercase())
+        user.email?.trim()?.lowercase()?.takeIf { it.contains("@") }?.let { merged.add(it) }
+        if (isBootstrappedAdmin(user)) {
+            merged.addAll(fleetMemberEmails)
+        } else {
+            existingMembers?.forEach { email ->
+                val clean = email.trim().lowercase()
+                if (clean.contains("@")) merged.add(clean)
+            }
+        }
+        return merged.take(25)
     }
 
     private fun trimTripArrays(t: Trip): Trip = t.copy(
@@ -786,6 +1060,9 @@ class FirebaseSyncManager(
         val meta = knownMeta["$col/$docId"]
         out["id"] = docId
         out["ownerId"] = meta?.ownerId ?: user.uid
+        if (col in SHARED_COLLECTIONS) {
+            out["memberEmails"] = buildMemberEmails(user, meta?.memberEmails)
+        }
         out["serverCreatedAt"] = meta?.serverCreatedAt ?: FieldValue.serverTimestamp()
         out["serverUpdatedAt"] = FieldValue.serverTimestamp()
         return out
@@ -824,5 +1101,34 @@ class FirebaseSyncManager(
 
     companion object {
         private const val TAG = "FirebaseSyncManager"
+
+        private val SHARED_COLLECTIONS = setOf(
+            "settings",
+            "trucks",
+            "driverAccounts",
+            "customers",
+            "orders",
+            "trips",
+            "gpsEvents",
+            "notifications",
+            "directives",
+            "tripStateLogs"
+        )
+
+        private val DRIVER_TRUCK_UPDATE_KEYS = listOf(
+            "currentWaterLiters", "status", "lastLat", "lastLng",
+            "lastSpeed", "lastUpdateTimestamp", "lastEvent",
+            "currentTripId", "odometerKm"
+        )
+
+        private val DRIVER_TRIP_UPDATE_KEYS = listOf(
+            "deliveredLiters", "remainingLiters", "status", "syncStatus",
+            "driverAcceptanceStatus", "driverRespondedAt", "driverResponseReason",
+            "customerStops", "startedAt", "startLocation", "returnedToPlantAt",
+            "returnLocation", "completedAt", "lastSyncedAt", "gpsPoints",
+            "detectedStops", "gpsGaps", "movingMinutes", "stoppedMinutes",
+            "auditLogs", "modificationRequests", "actualDistanceKm",
+            "actualFuelLiters", "fuelCost", "actualCost"
+        )
     }
 }

@@ -31,8 +31,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -60,6 +58,7 @@ import com.miyahna.water.domain.Order
 import com.miyahna.water.domain.OrderSource
 import com.miyahna.water.domain.OrderStatus
 import com.miyahna.water.domain.SystemSettings
+import com.miyahna.water.ui.common.CustomerOrderLookupSection
 import com.miyahna.water.ui.common.DistrictSelectField
 import com.miyahna.water.ui.common.EmptyStateCard
 import com.miyahna.water.ui.common.LocationPickerDialog
@@ -326,7 +325,6 @@ fun NewOrderDialog(
     ) -> Unit
 ) {
     var selectedCustomer by remember { mutableStateOf<Customer?>(null) }
-    var customerMenuOpen by remember { mutableStateOf(false) }
 
     var name by remember { mutableStateOf("") }
     var phone by remember { mutableStateOf("") }
@@ -359,52 +357,35 @@ fun NewOrderDialog(
             ) {
                 Text("تسجيل طلب مياه جديد", style = MaterialTheme.typography.titleLarge)
 
-                if (customers.isNotEmpty()) {
-                    Box(modifier = Modifier.fillMaxWidth()) {
-                        OutlinedButton(
-                            onClick = { customerMenuOpen = true },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 48.dp)
-                        ) {
-                            Text(selectedCustomer?.let { "العميل المختار: ${it.name}" } ?: "اختيار عميل مسجل (أو أدخل جديد بالأسفل)")
-                        }
-                        DropdownMenu(
-                            expanded = customerMenuOpen,
-                            onDismissRequest = { customerMenuOpen = false },
-                            modifier = Modifier.heightIn(max = 320.dp)
-                        ) {
-                            DropdownMenuItem(
-                                text = { Text("-- عميل جديد --") },
-                                onClick = {
-                                    selectedCustomer = null
-                                    customerMenuOpen = false
-                                }
-                            )
-                            customers.forEach { c ->
-                                DropdownMenuItem(
-                                    text = { Text("${c.name} (${c.district})") },
-                                    onClick = {
-                                        selectedCustomer = c
-                                        name = c.name
-                                        phone = c.phone
-                                        district = c.district
-                                        address = c.addressDetails
-                                        lat = c.lat
-                                        lng = c.lng
-                                        capacityText = c.tankCapacityLiters.toString()
-                                        litersText = c.tankCapacityLiters.toString()
-                                        customerMenuOpen = false
-                                    }
-                                )
-                            }
-                        }
+                CustomerOrderLookupSection(
+                    customers = customers,
+                    selectedCustomer = selectedCustomer,
+                    typedName = name,
+                    typedPhone = phone,
+                    onImportCustomer = { c ->
+                        selectedCustomer = c
+                        name = c.name
+                        phone = c.phone
+                        district = c.district
+                        address = c.addressDetails
+                        lat = c.lat
+                        lng = c.lng
+                        capacityText = c.tankCapacityLiters.toString()
+                        litersText = c.tankCapacityLiters.toString()
+                    },
+                    onSwitchToNewCustomer = {
+                        selectedCustomer = null
                     }
-                }
+                )
 
                 OutlinedTextField(
                     value = name,
-                    onValueChange = { name = it },
+                    onValueChange = { newName ->
+                        name = newName
+                        if (selectedCustomer != null && !selectedCustomer!!.name.equals(newName.trim(), ignoreCase = true)) {
+                            selectedCustomer = null
+                        }
+                    },
                     label = { Text("اسم العميل *") },
                     singleLine = true,
                     modifier = Modifier

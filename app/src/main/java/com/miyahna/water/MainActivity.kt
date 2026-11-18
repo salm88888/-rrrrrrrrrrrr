@@ -1,8 +1,13 @@
 package com.miyahna.water
 
 import android.Manifest
+import android.app.Activity
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -22,6 +27,7 @@ import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSiz
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -34,6 +40,9 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination.Companion.hasRoute
@@ -41,6 +50,7 @@ import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.miyahna.water.data.location.DeviceLocationHelper
 import com.miyahna.water.data.notifications.MiyahnaNotificationHelper
 import com.miyahna.water.domain.AppRole
 import com.miyahna.water.domain.DriverAccountStatus
@@ -108,6 +118,18 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            var attemptedAutoCloudSignIn by remember { mutableStateOf(false) }
+            LaunchedEffect(uiState.domain.isLoaded, uiState.domain.isOnline, uiState.domain.cloudUser) {
+                if (uiState.domain.isLoaded &&
+                    uiState.domain.isOnline &&
+                    uiState.domain.cloudUser == null &&
+                    !attemptedAutoCloudSignIn
+                ) {
+                    attemptedAutoCloudSignIn = true
+                    vm.attemptCloudAutoSignIn(activityContext)
+                }
+            }
+
             LaunchedEffect(pendingDeepLink, uiState.domain.isLoaded) {
                 val link = pendingDeepLink ?: return@LaunchedEffect
                 if (uiState.domain.isLoaded) {
@@ -159,34 +181,80 @@ private fun MiyahnaRootHost(
 ) {
     val domain = uiState.domain
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val navController = rememberNavController()
 
-    var hasLocationPermission by remember {
-        mutableStateOf(
+    fun checkLocationPermissionNow(): Boolean =
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED ||
             ContextCompat.checkSelfPermission(
                 context,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED ||
-                ContextCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.ACCESS_COARSE_LOCATION
-                ) == PackageManager.PERMISSION_GRANTED
-        )
-    }
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
 
-    var hasNotificationPermission by remember {
-        mutableStateOf(
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                ContextCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.POST_NOTIFICATIONS
-                ) == PackageManager.PERMISSION_GRANTED
-            } else {
-                true
-            }
-        )
+    fun checkNotificationPermissionNow(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+
+    var hasLocationPermission by remember { mutableStateOf(checkLocationPermissionNow()) }
+    var hasNotificationPermission by remember { mutableStateOf(checkNotificationPermissionNow()) }
+    var isDeviceGpsEnabled by remember {
+        mutableStateOf(DeviceLocationHelper.isDeviceGpsEnabled(context)).also {
+            viewModel.setDeviceGpsEnabled(it.value)
+        }
     }
     var promptedNotificationsOnce by remember { mutableStateOf(false) }
+
+    fun refreshLocationAndGpsState() {
+        hasLocationPermission = checkLocationPermissionNow()
+        hasNotificationPermission = checkNotificationPermissionNow()
+        val gpsNow = DeviceLocationHelper.isDeviceGpsEnabled(context)
+        isDeviceGpsEnabled = gpsNow
+        viewModel.setDeviceGpsEnabled(gpsNow)
+        if (domain.isLoaded &&
+            domain.savedRole == AppRole.DRIVER &&
+            domain.driverSession != null &&
+            hasLocationPermission
+        ) {
+            viewModel.ensureDriverBackgroundGpsRunning()
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, context) {
+        val lifecycleObserver = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                refreshLocationAndGpsState()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(lifecycleObserver)
+
+        val providerReceiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                refreshLocationAndGpsState()
+            }
+        }
+        val filter = IntentFilter(LocationManager.PROVIDERS_CHANGED_ACTION).apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                addAction(LocationManager.MODE_CHANGED_ACTION)
+            }
+        }
+        runCatching {
+            ContextCompat.registerReceiver(context, providerReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        }
+
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(lifecycleObserver)
+            runCatching { context.unregisterReceiver(providerReceiver) }
+        }
+    }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -194,17 +262,40 @@ private fun MiyahnaRootHost(
         hasNotificationPermission = granted
     }
 
+    val locationSettingsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) {
+        refreshLocationAndGpsState()
+    }
+
+    val requestEnableDeviceGps: () -> Unit = {
+        val activity = context as? Activity
+        if (activity != null) {
+            DeviceLocationHelper.promptEnableDeviceGps(
+                activity = activity,
+                resolutionLauncher = locationSettingsLauncher,
+                onAlreadyEnabled = { refreshLocationAndGpsState() }
+            )
+        } else {
+            DeviceLocationHelper.openLocationSettings(context)
+        }
+    }
+
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
         hasLocationPermission = grants[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-            grants[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+            grants[Manifest.permission.ACCESS_COARSE_LOCATION] == true ||
+            checkLocationPermissionNow()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             hasNotificationPermission = grants[Manifest.permission.POST_NOTIFICATIONS] == true ||
-                ContextCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.POST_NOTIFICATIONS
-                ) == PackageManager.PERMISSION_GRANTED
+                checkNotificationPermissionNow()
+        }
+        val gpsNow = DeviceLocationHelper.isDeviceGpsEnabled(context)
+        isDeviceGpsEnabled = gpsNow
+        viewModel.setDeviceGpsEnabled(gpsNow)
+        if (hasLocationPermission && !gpsNow) {
+            requestEnableDeviceGps()
         }
         if (hasLocationPermission && domain.savedRole == AppRole.DRIVER && domain.driverSession != null) {
             viewModel.ensureDriverBackgroundGpsRunning()
@@ -246,7 +337,7 @@ private fun MiyahnaRootHost(
     }
 
     // Keep background GPS active whenever the app is in Driver mode
-    LaunchedEffect(domain.isLoaded, domain.savedRole, domain.driverSession, hasLocationPermission) {
+    LaunchedEffect(domain.isLoaded, domain.savedRole, domain.driverSession, hasLocationPermission, isDeviceGpsEnabled) {
         if (domain.isLoaded && domain.savedRole == AppRole.DRIVER && domain.driverSession != null && hasLocationPermission) {
             viewModel.ensureDriverBackgroundGpsRunning()
         }
@@ -309,7 +400,10 @@ private fun MiyahnaRootHost(
                     onVerifyManagerPin = viewModel::verifyAndEnterManager,
                     onSelectDriver = viewModel::enterDriverPortal,
                     onCloudSignIn = onCloudSignIn,
-                    onCloudSignOut = viewModel::signOutCloud
+                    onCloudSignOut = viewModel::signOutCloud,
+                    isManagerUnlocked = domain.isManagerUnlocked,
+                    hasSavedDriverSession = domain.driverSession != null,
+                    onEnterManagerDirectly = viewModel::enterManagerDirectly
                 )
             }
             composable<ManagerRoute> {
@@ -324,14 +418,19 @@ private fun MiyahnaRootHost(
                 DriverAuthScreen(
                     onBackToPortal = viewModel::switchRolePortal,
                     onLogin = viewModel::loginDriver,
-                    onRegister = viewModel::registerDriver
+                    onRegister = viewModel::registerDriver,
+                    isOnline = domain.isOnline,
+                    cloudUser = domain.cloudUser,
+                    onCloudSignIn = onCloudSignIn
                 )
             }
             composable<DriverAppRoute> {
                 DriverAppScreen(
                     uiState = uiState,
                     hasLocationPermission = hasLocationPermission,
+                    isDeviceGpsEnabled = isDeviceGpsEnabled,
                     onRequestLocationPermission = requestLocationAndNotificationPermissions,
+                    onEnableDeviceGps = requestEnableDeviceGps,
                     onRequestCloudSignIn = onCloudSignIn,
                     viewModel = viewModel
                 )

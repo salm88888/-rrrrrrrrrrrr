@@ -21,6 +21,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.miyahna.water.domain.Customer
+import com.miyahna.water.domain.Order
 import com.miyahna.water.domain.SystemSettings
 import com.miyahna.water.domain.Trip
 import com.miyahna.water.domain.TripStatus
@@ -36,6 +37,7 @@ fun MaribMapScreen(
     truck: Truck,
     fleetTrucks: List<Truck> = listOf(truck),
     customers: List<Customer>,
+    orders: List<Order> = emptyList(),
     trips: List<Trip>,
     onUpdatePlantLocation: (Double, Double) -> Unit
 ) {
@@ -70,7 +72,7 @@ fun MaribMapScreen(
                     )
                 }
                 OutlinedButton(onClick = { showPlantPicker = true }) {
-                    Text("موقع المصنع")
+                    Text("تعديل موقع المصنع")
                 }
             }
         }
@@ -79,6 +81,7 @@ fun MaribMapScreen(
             plantLocation = settings.plantLocation,
             geofenceMeters = settings.plantGeofenceMeters,
             customers = customers,
+            orders = orders,
             truck = truck,
             trucks = fleetTrucks,
             plannedStops = activeTrip?.customerStops.orEmpty(),
